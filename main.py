@@ -1392,10 +1392,12 @@ def blocked_numbers_page(user: str, draw: str, msg: str = None, error: str = Non
 @app.post("/save-blocked")
 def save_blocked(user: str = Form(...), draw: str = Form(...), raw_input: str = Form(...), status: str = Form(...)):
     try:
-        conn = connect_db(); c = conn.cursor()
+        conn = connect_db()
+        c = conn.cursor()
         cleaned = raw_input.replace('\r\n', ',').replace('\n', ',').replace(' ', ',')
         raw_numbers = [item.strip() for item in cleaned.split(',') if item.strip()]
         insert_data, seen = [], set()
+        
         for num_str in raw_numbers:
             t_val = "3ตัว" if len(num_str) == 3 else ("2ตัว" if len(num_str) == 2 else ("วิ่ง" if len(num_str) == 1 else "อื่นๆ"))
             if num_str not in seen:
@@ -1405,10 +1407,15 @@ def save_blocked(user: str = Form(...), draw: str = Form(...), raw_input: str = 
                 if p_num not in seen:
                     insert_data.append((draw.strip(), p_num, status, t_val, False))
                     seen.add(p_num)
+                    
         c.executemany("INSERT INTO BlockedNumbers (draw_date, raw_num, status, type, is_raw) VALUES (%s, %s, %s, %s, %s)", insert_data)
-        conn.commit(); conn.close()
-        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&msg=บันทึกสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
-    except: pass
+        conn.commit()
+        conn.close()
+        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&msg=บันทึกเลขอั้นสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+    except Exception as e:
+        print("Save Blocked Error:", e)
+        # ส่งข้อความ Error กลับไปแสดงที่หน้าจอแทนการขึ้นคำว่า null
+        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&error=บันทึกไม่สำเร็จ: {str(e)}", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/update-blocked")
 def update_blocked(user: str = Form(...), draw: str = Form(...), blocked_id: int = Form(...), raw_num: str = Form(...), status: str = Form(...)):
