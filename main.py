@@ -1932,6 +1932,182 @@ def update_password(user: str = Form(...), draw: str = Form(...), old_password: 
         return RedirectResponse(url=f"/password?user={user}&draw={draw}&msg=เปลี่ยนรหัสผ่านสำเร็จ!", status_code=status.HTTP_303_SEE_OTHER)
     except: pass
 
+# ================= หน้าจอจัดการเรตลูกค้าแยกตามหวย (ระบบหลัก) =================
+CUSTOMER_RATES_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <title>กำหนดเรตอัตราจ่ายและส่วนลดตามหวย</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+    <div class="container my-4">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2>⚙️ กำหนดเรตอัตราจ่าย & ส่วนลด (แยกรายลูกค้า / แยกรายหวย)</h2>
+            <a href="/admin-dashboard?user={{ username }}" class="btn btn-secondary">กลับหน้าหลัก</a>
+        </div>
+
+        {% if msg %}
+        <div class="alert alert-success">{{ msg }}</div>
+        {% endif %}
+
+        <div class="card shadow p-4 mb-4">
+            <form method="POST" action="/save-customer-lotto-rate">
+                <input type="hidden" name="username" value="{{ username }}">
+                <div class="row g-3">
+                    <div class="col-md-4">
+                        <label class="form-label fw-bold">1. เลือกลูกค้า:</label>
+                        <select name="customer_id" class="form-select" required>
+                            <option value="">-- เลือกลูกค้า --</option>
+                            {% for cust in customers %}
+                            <option value="{{ cust[0] }}">{{ cust[1] }} (เจ้าของ: {{ cust[2] }})</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label fw-bold">2. เลือกประเภทหวย:</label>
+                        <select name="lotto_name" class="form-select" required>
+                            <option value="">-- เลือกลอตเตอรี่ / หวย --</option>
+                            {% for lotto in lotto_list %}
+                            <option value="{{ lotto }}">{{ lotto }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-4 d-flex align-items-end">
+                        <button type="submit" class="btn btn-primary w-100 fw-bold">💾 บันทึก / อัปเดตเรต</button>
+                    </div>
+                </div>
+
+                <hr class="my-4">
+
+                <h5 class="fw-bold mb-3 text-primary">💰 กำหนดอัตราจ่าย (Pay Rate)</h5>
+                <div class="row g-3 mb-3">
+                    <div class="col-md-3"><label class="form-label small">3 ตัวตรง:</label><input type="number" step="any" name="pay_3d" class="form-control" value="500"></div>
+                    <div class="col-md-3"><label class="form-label small">3 ตัวโต๊ด:</label><input type="number" step="any" name="pay_3tod" class="form-control" value="100"></div>
+                    <div class="col-md-3"><label class="form-label small">2 ตัว (บน/ล่าง):</label><input type="number" step="any" name="pay_2d" class="form-control" value="70"></div>
+                    <div class="col-md-3"><label class="form-label small">วิ่งบน:</label><input type="number" step="any" name="pay_run_top" class="form-control" value="3.2"></div>
+                </div>
+
+                <h5 class="fw-bold mb-3 text-success">📉 กำหนดส่วนลด (%)</h5>
+                <div class="row g-3">
+                    <div class="col-md-4"><label class="form-label small">ส่วนลด 3 ตัว (%):</label><input type="number" step="any" name="disc_3d" class="form-control" value="0"></div>
+                    <div class="col-md-4"><label class="form-label small">ส่วนลด 2 ตัว (%):</label><input type="number" step="any" name="disc_2d" class="form-control" value="0"></div>
+                    <div class="col-md-4"><label class="form-label small">ส่วนลดรวมทุกประเภท (%):</label><input type="number" step="any" name="disc_total" class="form-control" value="0"></div>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+@app.get("/customer-rates-page", response_class=HTMLResponse)
+def customer_rates_page(user: str, msg: str = None):
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        
+        # ดึงรายชื่อลูกค้าทั้งหมด
+        c.execute("SELECT id, name, owner_username FROM Customers ORDER BY id DESC")
+        customers = c.fetchall()
+        
+        # ดึงรายชื่อหวยทั้งหมดที่ไม่ซ้ำกันจากตาราง LotteryCampaigns
+        c.execute("SELECT DISTINCT lotto_name FROM LotteryCampaigns WHERE lotto_name IS NOT NULL")
+        lotto_list = [row[0] for row in c.fetchall()]
+        
+        conn.close()
+    except Exception as e:
+        print("Load Customer Rates Error:", e)
+        customers = []
+        lotto_list = []
+    
+    return Template(CUSTOMER_RATES_TEMPLATE).render(
+        username=user, 
+        customers=customers, 
+        lotto_list=lotto_list, 
+        msg=msg
+    )
+
+@app.post("/save-customer-lotto-rate")
+def save_customer_lotto_rate(
+    username: str = Form(...), 
+    customer_id: int = Form(...), 
+    lotto_name: str = Form(...),
+    pay_3d: float = Form(500), 
+    pay_3tod: float = Form(100), 
+    pay_2d: float = Form(70), 
+    pay_run_top: float = Form(3.2),
+    disc_3d: float = Form(0), 
+    disc_2d: float = Form(0), 
+    disc_total: float = Form(0)
+):
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        
+        # บันทึกข้อมูลลงตาราง CustomerLottoRates (ใช้ ON CONFLICT เพื่ออัปเดตทันทีถ้ามีอยู่แล้ว)
+        c.execute("""
+            INSERT INTO CustomerLottoRates (
+                customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, 
+                pay_run_top, disc_3d, disc_2d, disc_total
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (customer_id, lotto_name) 
+            DO UPDATE SET 
+                pay_3d = EXCLUDED.pay_3d, 
+                pay_3tod = EXCLUDED.pay_3tod, 
+                pay_2d = EXCLUDED.pay_2d, 
+                pay_run_top = EXCLUDED.pay_run_top, 
+                disc_3d = EXCLUDED.disc_3d, 
+                disc_2d = EXCLUDED.disc_2d, 
+                disc_total = EXCLUDED.disc_total
+        """, (customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, pay_run_top, disc_3d, disc_2d, disc_total))
+        
+        conn.commit()
+        conn.close()
+        msg = "บันทึกเรตอัตราจ่ายและส่วนลดสำเร็จ!"
+    except Exception as e:
+        msg = f"Error: {str(e)}"
+        
+    return RedirectResponse(url=f"/customer-rates-page?user={username}&msg={msg}", status_code=status.HTTP_303_SEE_OTHER)
+@app.get("/customer-rates-page", response_class=HTMLResponse)
+def customer_rates_page(user: str, msg: str = None):
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("SELECT id, name, owner_username FROM Customers")
+    customers = c.fetchall()
+    
+    # ดึงรายชื่อหวยทั้งหมดจากแคมเปญ
+    c.execute("SELECT DISTINCT lotto_name FROM LotteryCampaigns")
+    lotto_list = [row[0] for row in c.fetchall()]
+    conn.close()
+    
+    return Template(CUSTOMER_RATES_TEMPLATE).render(username=user, customers=customers, lotto_list=lotto_list, msg=msg)
+
+@app.post("/save-customer-lotto-rate")
+def save_customer_lotto_rate(
+    username: str = Form(...), customer_id: int = Form(...), lotto_name: str = Form(...),
+    pay_3d: float = Form(500), pay_3tod: float = Form(100), pay_2d: float = Form(70), pay_run_top: float = Form(3.2),
+    disc_3d: float = Form(0), disc_2d: float = Form(0), disc_total: float = Form(0)
+):
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO CustomerLottoRates (customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, pay_run_top, disc_3d, disc_2d, disc_total)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (customer_id, lotto_name) 
+            DO UPDATE SET pay_3d = EXCLUDED.pay_3d, pay_3tod = EXCLUDED.pay_3tod, pay_2d = EXCLUDED.pay_2d, 
+                          pay_run_top = EXCLUDED.pay_run_top, disc_3d = EXCLUDED.disc_3d, disc_2d = EXCLUDED.disc_2d, disc_total = EXCLUDED.disc_total
+        """, (customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, pay_run_top, disc_3d, disc_2d, disc_total))
+        conn.commit()
+        conn.close()
+        msg = "บันทึกเรตอัตราจ่ายและส่วนลดสำเร็จ!"
+    except Exception as e:
+        msg = f"Error: {str(e)}"
+    return RedirectResponse(url=f"/customer-rates-page?user={username}&msg={msg}", status_code=status.HTTP_303_SEE_OTHER)
+
 @app.get("/logout")
 def logout():
     return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
