@@ -1945,7 +1945,7 @@ CUSTOMER_RATES_TEMPLATE = """
     <div class="container my-4">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <h2>⚙️ กำหนดเรตอัตราจ่าย & ส่วนลด (แยกรายลูกค้า / แยกรายหวย)</h2>
-            <a href="/admin-dashboard?user={{ username }}" class="btn btn-secondary">กลับหน้าหลัก</a>
+            <a href="/dashboard?user=admin&draw=หน้าหลักจัดการงวด" class="btn btn-secondary">กลับหน้าหลัก</a>
         </div>
 
         {% if msg %}
