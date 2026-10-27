@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import itertools
 import re
 
-app = FastAPI(title="Lotto ERP Full Enterprise Cloud")
+app = FastAPI(title="Lotto ERP Full Enterprise Cloud", debug=True)
 
 # ===== ตั้งค่าฐานข้อมูล =====
 DB_URI = "postgresql://postgres.mpyswshlrxwpirzdexrn:Clublifekorat3888@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
