@@ -1411,12 +1411,10 @@ def save_blocked(user: str = Form(...), draw: str = Form(...), raw_input: str = 
         c.executemany("INSERT INTO BlockedNumbers (draw_date, raw_num, status, type, is_raw) VALUES (%s, %s, %s, %s, %s)", insert_data)
         conn.commit()
         conn.close()
-        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&msg=บันทึกเลขอั้นสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&msg=บันทึกเลขอั้นสำเร็จ", status_code=303)
     except Exception as e:
-        print("Save Blocked Error:", e)
-        # ส่งข้อความ Error กลับไปแสดงที่หน้าจอแทนการขึ้นคำว่า null
-        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&error=บันทึกไม่สำเร็จ: {str(e)}", status_code=status.HTTP_303_SEE_OTHER)
-
+        print("ข้อผิดพลาดในการบันทึกถูกบล็อก:", e)
+        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&error=บันทึกไม่สำเร็จ: {str(e)}", status_code=303)
 @app.post("/update-blocked")
 def update_blocked(user: str = Form(...), draw: str = Form(...), blocked_id: int = Form(...), raw_num: str = Form(...), status: str = Form(...)):
     try:
