@@ -1967,7 +1967,7 @@ CUSTOMER_RATES_TEMPLATE = """
     <div class="container my-4">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <h2>⚙️ กำหนดเรตอัตราจ่าย & ส่วนลด (แยกรายลูกค้า / แยกรายหวย)</h2>
-            <a href="/dashboard?user=admin&draw=หน้าหลักจัดการงวด" class="btn btn-secondary">กลับหน้าหลัก</a>
+            <a href="/dashboard?user={{ username }}&draw=หน้าหลักจัดการงวด" class="btn btn-secondary">กลับหน้าหลัก</a>
         </div>
 
         {% if msg %}
@@ -2009,6 +2009,7 @@ CUSTOMER_RATES_TEMPLATE = """
                     <div class="col-md-3"><label class="form-label small">3 ตัวโต๊ด:</label><input type="number" step="any" name="pay_3tod" class="form-control" value="100"></div>
                     <div class="col-md-3"><label class="form-label small">2 ตัว (บน/ล่าง):</label><input type="number" step="any" name="pay_2d" class="form-control" value="70"></div>
                     <div class="col-md-3"><label class="form-label small">วิ่งบน:</label><input type="number" step="any" name="pay_run_top" class="form-control" value="3.2"></div>
+                    <div class="col-md-3"><label class="form-label small text-danger fw-bold">วิ่งล่าง:</label><input type="number" step="any" name="pay_run_bot" class="form-control" value="4.2"></div>
                 </div>
 
                 <h5 class="fw-bold mb-3 text-success">📉 กำหนดส่วนลด (%)</h5>
@@ -2029,15 +2030,10 @@ def customer_rates_page(user: str, msg: str = None):
     try:
         conn = connect_db()
         c = conn.cursor()
-        
-        # ดึงรายชื่อลูกค้าทั้งหมด
         c.execute("SELECT id, name, owner_username FROM Customers ORDER BY id DESC")
         customers = c.fetchall()
-        
-        # ดึงรายชื่อหวยทั้งหมดที่ไม่ซ้ำกันจากตาราง LotteryCampaigns
         c.execute("SELECT DISTINCT lotto_name FROM LotteryCampaigns WHERE lotto_name IS NOT NULL")
         lotto_list = [row[0] for row in c.fetchall()]
-        
         conn.close()
     except Exception as e:
         print("Load Customer Rates Error:", e)
@@ -2045,10 +2041,7 @@ def customer_rates_page(user: str, msg: str = None):
         lotto_list = []
     
     return Template(CUSTOMER_RATES_TEMPLATE).render(
-        username=user, 
-        customers=customers, 
-        lotto_list=lotto_list, 
-        msg=msg
+        username=user, customers=customers, lotto_list=lotto_list, msg=msg
     )
 
 @app.post("/save-customer-lotto-rate")
@@ -2060,6 +2053,7 @@ def save_customer_lotto_rate(
     pay_3tod: float = Form(100), 
     pay_2d: float = Form(70), 
     pay_run_top: float = Form(3.2),
+    pay_run_bot: float = Form(4.2),  # เพิ่มช่องรับค่าวิ่งล่าง
     disc_3d: float = Form(0), 
     disc_2d: float = Form(0), 
     disc_total: float = Form(0)
@@ -2067,24 +2061,23 @@ def save_customer_lotto_rate(
     try:
         conn = connect_db()
         c = conn.cursor()
-        
-        # บันทึกข้อมูลลงตาราง CustomerLottoRates (ใช้ ON CONFLICT เพื่ออัปเดตทันทีถ้ามีอยู่แล้ว)
         c.execute("""
             INSERT INTO CustomerLottoRates (
                 customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, 
-                pay_run_top, disc_3d, disc_2d, disc_total
+                pay_run_top, pay_run_bot, disc_3d, disc_2d, disc_total
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (customer_id, lotto_name) 
             DO UPDATE SET 
                 pay_3d = EXCLUDED.pay_3d, 
                 pay_3tod = EXCLUDED.pay_3tod, 
                 pay_2d = EXCLUDED.pay_2d, 
                 pay_run_top = EXCLUDED.pay_run_top, 
+                pay_run_bot = EXCLUDED.pay_run_bot, 
                 disc_3d = EXCLUDED.disc_3d, 
                 disc_2d = EXCLUDED.disc_2d, 
                 disc_total = EXCLUDED.disc_total
-        """, (customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, pay_run_top, disc_3d, disc_2d, disc_total))
+        """, (customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_3d, disc_2d, disc_total))
         
         conn.commit()
         conn.close()
@@ -2092,8 +2085,7 @@ def save_customer_lotto_rate(
     except Exception as e:
         msg = f"Error: {str(e)}"
         
-    return RedirectResponse(url=f"/customer-rates-page?user={username}&msg={msg}", status_code=status.HTTP_303_SEE_OTHER)
-
+    return RedirectResponse(url=f"/customer-rates-page?user={username}&msg={msg}", status_code=303)
 @app.get("/logout")
 def logout():
     return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
