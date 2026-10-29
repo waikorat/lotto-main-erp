@@ -389,6 +389,11 @@ LAYOUT = """
                 ⚙️ เรตลูกค้าแยกตามหวย
             </a>
 
+<!-- นำปุ่มนี้ไปแทรกไว้ในหน้าเมนูหรือหน้าเลือกตลาดของ Admin -->
+            <a href="/system-reset?user={{ username }}" class="btn btn-outline-danger btn-sm fw-bold">
+                ⚠️ รีเซ็ตระบบ (Go-Live)
+            </a>
+
             <div class="sidebar-section-title">แทงหวย</div>
             <a href="/campaigns?user={{ username }}" class="sidebar-menu-item text-warning fw-bold">▶ จัดการและเลือกงวดหวย</a>
             {% if role == 'Admin' %}
@@ -446,6 +451,104 @@ LOGIN_TEMPLATE = """
 </body>
 </html>
 """
+
+# ================= 8. หน้าจอและฟังก์ชันรีเซ็ตระบบ (Factory Reset สำหรับ Admin) =================
+SYSTEM_RESET_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <title>LuckyNumber - System Reset (Go-Live)</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="bg-danger-subtle d-flex align-items-center justify-content-center" style="height: 100vh;">
+    <div class="card shadow-lg p-5 border border-danger border-3 bg-white" style="max-width: 600px; width: 100%;">
+        <div class="text-center mb-4">
+            <i class="fa-solid fa-triangle-exclamation text-danger fa-4x mb-3"></i>
+            <h2 class="text-danger fw-bold">⚠️ พื้นที่อันตราย: รีเซ็ตระบบเพื่อใช้งานจริง (Factory Reset)</h2>
+            <p class="text-muted small mt-2">คำสั่งนี้จะล้างข้อมูลการทดสอบทั้งหมดในฐานข้อมูลออกอย่างถาวร (โพย, ลูกค้า, สมาชิกทดสอบ, เลขอั้น, เรต, และงวดหวย) เพื่อให้ระบบสะอาดพร้อมเริ่มต้นใช้งานจริง</p>
+        </div>
+
+        {% if error %}
+        <div class="alert alert-danger text-center fw-bold">{{ error }}</div>
+        {% endif %}
+
+        <form method="POST" action="/execute-system-reset" onsubmit="return confirm('⚠️ คำเตือนขั้นเด็ดขาด! คุณแน่ใจจริงๆ หรือไม่ที่จะล้างข้อมูลทั้งหมดในระบบออก? ข้อมูลที่ถูกลบจะไม่สามารถกู้คืนได้!');">
+            <input type="hidden" name="username" value="{{ username }}">
+            
+            <div class="mb-3">
+                <label class="form-label fw-bold text-dark">🔑 ยืนยันรหัสผ่าน Admin ของคุณ:</label>
+                <input type="password" name="admin_password" class="form-control form-control-lg" placeholder="กรอกรหัสผ่านเพื่อยืนยัน..." required autofocus>
+            </div>
+
+            <div class="d-grid gap-2 mt-4">
+                <button type="submit" class="btn btn-danger btn-lg fw-bold py-3">
+                    <i class="fa-solid fa-bomb"></i> ยืนยันล้างข้อมูลและรีเซ็ตระบบทั้งหมด
+                </button>
+                <a href="/select-market?user={{ username }}" class="btn btn-outline-secondary btn-lg fw-bold py-2">
+                    ❌ ยกเลิกและกลับสู่หน้าหลัก
+                </a>
+            </div>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+@app.get("/system-reset", response_class=HTMLResponse)
+def system_reset_page(user: str, error: str = None):
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        # ตรวจสอบสิทธิ์ว่าเป็น Admin จริงหรือไม่
+        c.execute("SELECT role FROM Users WHERE username=%s", (user,))
+        res = c.fetchone()
+        conn.close()
+        
+        role = res[0] if res else ""
+        if role != 'Admin':
+            return RedirectResponse(url=f"/select-market?user={user}", status_code=303)
+    except:
+        return RedirectResponse(url=f"/select-market?user={user}", status_code=303)
+
+    return Template(SYSTEM_RESET_TEMPLATE).render(username=user, error=error)
+
+@app.post("/execute-system-reset")
+def execute_system_reset(username: str = Form(...), admin_password: str = Form(...)):
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        
+        # 1. ตรวจสอบรหัสผ่านของ Admin เพื่อความปลอดภัยสูงสุด
+        c.execute("SELECT id FROM Users WHERE username=%s AND password=%s AND role='Admin'", (username, admin_password))
+        admin_check = c.fetchone()
+        
+        if not admin_check:
+            conn.close()
+            return RedirectResponse(url=f"/system-reset?user={username}&error=รหัสผ่าน Admin ไม่ถูกต้อง ไม่สามารถรีเซ็ตระบบได้!", status_code=303)
+
+        # 2. ทำการเคลียร์ข้อมูลในตารางต่างๆ ออกทั้งหมด
+        c.execute("DELETE FROM Transactions;")
+        c.execute("DELETE FROM TempDraft;")
+        c.execute("DELETE FROM BlockedNumbers;")
+        c.execute("DELETE FROM CustomerLottoRates;")
+        c.execute("DELETE FROM AgentSettlements;")
+        c.execute("DELETE FROM DrawResults;")
+        c.execute("DELETE FROM Customers;")
+        c.execute("DELETE FROM LotteryCampaigns;")
+        
+        # 3. ลบ Users ทั้งหมด ยกเว้นบัญชี Admin ปัจจุบัน
+        c.execute("DELETE FROM Users WHERE username != %s;", (username,))
+        
+        conn.commit()
+        conn.close()
+        
+        # รีเซ็ตสำเร็จ เด้งกลับไปหน้า Login พร้อมข้อความ
+        return RedirectResponse(url="/login?error=รีเซ็ตระบบสำเร็จ! ข้อมูลถูกล้างเกลี้ยงพร้อมเริ่มใช้งานจริงแล้ว กรุณาเข้าสู่ระบบใหม่อีกครั้ง", status_code=303)
+        
+    except Exception as e:
+        return RedirectResponse(url=f"/system-reset?user={username}&error=เกิดข้อผิดพลาดในการรีเซ็ต: {str(e)}", status_code=303)
 
 CAMPAIGN_TEMPLATE = """
 <div class="container my-3" style="max-width: 900px;">
@@ -1929,6 +2032,60 @@ def save_user_level(user: str = Form(...), draw: str = Form(...), new_username: 
         conn.commit(); conn.close()
         return RedirectResponse(url=f"/users?user={user}&draw={draw}&msg=สร้างสมาชิกใหม่สำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
     except: pass
+
+@app.get("/system-reset", response_class=HTMLResponse)
+def system_reset_page(user: str, error: str = None):
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        # ตรวจสอบสิทธิ์ว่าเป็น Admin จริงหรือไม่
+        c.execute("SELECT role FROM Users WHERE username=%s", (user,))
+        res = c.fetchone()
+        conn.close()
+        
+        role = res[0] if res else ""
+        if role != 'Admin':
+            return RedirectResponse(url=f"/select-market?user={user}", status_code=303)
+    except:
+        return RedirectResponse(url=f"/select-market?user={user}", status_code=303)
+
+    return Template(SYSTEM_RESET_TEMPLATE).render(username=user, error=error)
+
+@app.post("/execute-system-reset")
+def execute_system_reset(username: str = Form(...), admin_password: str = Form(...)):
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        
+        # 1. ตรวจสอบรหัสผ่านของ Admin เพื่อความปลอดภัยสูงสุด
+        c.execute("SELECT id FROM Users WHERE username=%s AND password=%s AND role='Admin'", (username, admin_password))
+        admin_check = c.fetchone()
+        
+        if not admin_check:
+            conn.close()
+            return RedirectResponse(url=f"/system-reset?user={username}&error=รหัสผ่าน Admin ไม่ถูกต้อง ไม่สามารถรีเซ็ตระบบได้!", status_code=303)
+
+        # 2. ทำการเคลียร์ข้อมูลในตารางต่างๆ ออกทั้งหมดอย่างหมดจด
+        c.execute("DELETE FROM Transactions;")
+        c.execute("DELETE FROM TempDraft;")
+        c.execute("DELETE FROM BlockedNumbers;")
+        c.execute("DELETE FROM CustomerLottoRates;")
+        c.execute("DELETE FROM AgentSettlements;")
+        c.execute("DELETE FROM DrawResults;")
+        c.execute("DELETE FROM Customers;")
+        c.execute("DELETE FROM LotteryCampaigns;")
+        
+        # 3. ลบ Users ทั้งหมด ยกเว้นบัญชี Admin ปัจจุบันของคุณบุญชัย
+        c.execute("DELETE FROM Users WHERE username != %s;", (username,))
+        
+        conn.commit()
+        conn.close()
+        
+        # รีเซ็ตสำเร็จ เด้งกลับไปหน้า Login พร้อมข้อความแจ้งเตือน
+        return RedirectResponse(url="/login?error=รีเซ็ตระบบสำเร็จ! ข้อมูลถูกล้างเกลี้ยงพร้อมเริ่มใช้งานจริงแล้ว กรุณาเข้าสู่ระบบใหม่อีกครั้ง", status_code=303)
+        
+    except Exception as e:
+        return RedirectResponse(url=f"/system-reset?user={username}&error=เกิดข้อผิดพลาดในการรีเซ็ต: {str(e)}", status_code=303)
 
 @app.get("/password", response_class=HTMLResponse)
 def password_page(user: str, draw: str, msg: str = None, error: str = None):
