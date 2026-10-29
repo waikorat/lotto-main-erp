@@ -143,6 +143,25 @@ def startup_db():
             );
         """)
         conn.commit()
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS CustomerLottoRates (
+                id SERIAL PRIMARY KEY,
+                customer_id INT REFERENCES Customers(id) ON DELETE CASCADE,
+                lotto_name VARCHAR(100) NOT NULL,
+                pay_3d NUMERIC(10,2) DEFAULT 500,
+                pay_3tod NUMERIC(10,2) DEFAULT 100,
+                pay_2d NUMERIC(10,2) DEFAULT 70,
+                pay_run_top NUMERIC(10,2) DEFAULT 3.2,
+                pay_run_bot NUMERIC(10,2) DEFAULT 4.2,
+                disc_3d NUMERIC(5,2) DEFAULT 0,
+                disc_2d NUMERIC(5,2) DEFAULT 0,
+                disc_run NUMERIC(5,2) DEFAULT 0,
+                disc_total NUMERIC(5,2) DEFAULT 0,
+                UNIQUE(customer_id, lotto_name)
+            );
+        """)
+        conn.commit()
         conn.close()
     except Exception as e:
         print("Startup DB Init Warning:", e)
@@ -364,6 +383,11 @@ LAYOUT = """
             {% elif role == 'Agent' %}
                 <a href="/users?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">▶ สมาชิก</a>
             {% endif %}
+
+            <div class="sidebar-section-title">ตั้งค่าเรตพิเศษ</div>
+            <a href="/customer-rates-page?user={{ username }}" class="sidebar-menu-item text-warning fw-bold">
+                ⚙️ เรตลูกค้าแยกตามหวย
+            </a>
 
             <div class="sidebar-section-title">แทงหวย</div>
             <a href="/campaigns?user={{ username }}" class="sidebar-menu-item text-warning fw-bold">▶ จัดการและเลือกงวดหวย</a>
@@ -2068,42 +2092,6 @@ def save_customer_lotto_rate(
     except Exception as e:
         msg = f"Error: {str(e)}"
         
-    return RedirectResponse(url=f"/customer-rates-page?user={username}&msg={msg}", status_code=status.HTTP_303_SEE_OTHER)
-@app.get("/customer-rates-page", response_class=HTMLResponse)
-def customer_rates_page(user: str, msg: str = None):
-    conn = connect_db()
-    c = conn.cursor()
-    c.execute("SELECT id, name, owner_username FROM Customers")
-    customers = c.fetchall()
-    
-    # ดึงรายชื่อหวยทั้งหมดจากแคมเปญ
-    c.execute("SELECT DISTINCT lotto_name FROM LotteryCampaigns")
-    lotto_list = [row[0] for row in c.fetchall()]
-    conn.close()
-    
-    return Template(CUSTOMER_RATES_TEMPLATE).render(username=user, customers=customers, lotto_list=lotto_list, msg=msg)
-
-@app.post("/save-customer-lotto-rate")
-def save_customer_lotto_rate(
-    username: str = Form(...), customer_id: int = Form(...), lotto_name: str = Form(...),
-    pay_3d: float = Form(500), pay_3tod: float = Form(100), pay_2d: float = Form(70), pay_run_top: float = Form(3.2),
-    disc_3d: float = Form(0), disc_2d: float = Form(0), disc_total: float = Form(0)
-):
-    try:
-        conn = connect_db()
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO CustomerLottoRates (customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, pay_run_top, disc_3d, disc_2d, disc_total)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (customer_id, lotto_name) 
-            DO UPDATE SET pay_3d = EXCLUDED.pay_3d, pay_3tod = EXCLUDED.pay_3tod, pay_2d = EXCLUDED.pay_2d, 
-                          pay_run_top = EXCLUDED.pay_run_top, disc_3d = EXCLUDED.disc_3d, disc_2d = EXCLUDED.disc_2d, disc_total = EXCLUDED.disc_total
-        """, (customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, pay_run_top, disc_3d, disc_2d, disc_total))
-        conn.commit()
-        conn.close()
-        msg = "บันทึกเรตอัตราจ่ายและส่วนลดสำเร็จ!"
-    except Exception as e:
-        msg = f"Error: {str(e)}"
     return RedirectResponse(url=f"/customer-rates-page?user={username}&msg={msg}", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.get("/logout")
