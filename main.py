@@ -1,259 +1,273 @@
 from fastapi import FastAPI, Form, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from jinja2 import Template as _JinjaTemplate
+from jinja2 import Template
 import psycopg2
 from datetime import datetime, timedelta
 import itertools
 import re
-import os
-import html
-import time
-import asyncio
-from urllib.parse import urlencode, quote, parse_qsl
 
-import common  # โมดูลกลาง — ต้องอยู่โฟลเดอร์เดียวกับไฟล์นี้ (ตั้ง DB_URI / SECRET_KEY ใน environment variable)
+app = FastAPI(title="Lotto ERP Full Enterprise Cloud", debug=True)
 
-
-def Template(source):
-    """Jinja Template ที่เปิด autoescape (กัน XSS) — ใช้แทน jinja2.Template เดิมโดยไม่ต้องแก้จุดที่เรียกใช้"""
-    return _JinjaTemplate(source, autoescape=True)
-
-
-app = FastAPI(title="Lotto ERP Full Enterprise Cloud", debug=False, docs_url=None, redoc_url=None, openapi_url=None)
-
-# ===== ตั้งค่าฐานข้อมูล (ค่ามาจาก environment variable DB_URI เท่านั้น) =====
-DB_URI = common.DB_URI
-COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"
-
+# ===== ตั้งค่าฐานข้อมูล =====
+DB_URI = "postgresql://postgres.mpyswshlrxwpirzdexrn:Clublifekorat3888@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
 
 def connect_db():
     return psycopg2.connect(DB_URI)
 
-
 # ฟังก์ชันดึงเวลาไทย (UTC+7)
 def get_thai_time():
-    return common.get_thai_time()
-
-
-def _q(v):
-    """encode ค่าสำหรับใส่ใน URL"""
-    return quote(str(v), safe="")
-
-
-def route_error(e=None):
-    """แทนการกลืน error เงียบๆ (except: pass เดิม) — บันทึกลง log และแจ้งผู้ใช้"""
-    import traceback
-    traceback.print_exc()
-    return HTMLResponse(
-        "<div style='font-family:sans-serif;max-width:560px;margin:60px auto;text-align:center'>"
-        "<h3>⚠️ เกิดข้อผิดพลาดในระบบ</h3>"
-        "<p>รายการนี้ไม่ได้ถูกบันทึก กรุณาลองใหม่อีกครั้ง หากยังเป็นอยู่ให้แจ้งผู้ดูแลระบบ</p>"
-        "<a href='javascript:history.back()'>⬅ ย้อนกลับ</a></div>", status_code=500)
-
-
-# ============================================================ Session + สิทธิ์การเข้าถึง (ASGI middleware)
-# หลักการ: ทุกคำขอ (ยกเว้น /login, /logout, /) ต้องมี cookie session ที่ลงลายเซ็นถูกต้อง
-# แล้ว middleware จะ "เขียนทับ" พารามิเตอร์ user / username ในคำขอด้วยชื่อผู้ใช้จาก session เสมอ
-# -> ต่อให้ใครแก้ URL เป็น ?user=admin ระบบก็ยังเห็นเป็นคนที่ล็อกอินจริง
-
-_PUBLIC_PATHS = {"/", "/login", "/logout"}
-_ADMIN_ONLY = {
-    "/create-campaign", "/update-campaign", "/toggle-campaign",
-    "/blocked-numbers", "/save-blocked", "/update-blocked", "/delete-blocked", "/clear-blocked",
-    "/results", "/save-results", "/audit-all", "/db-inspector",
-    "/system-reset", "/execute-system-reset",
-}
-_MANAGER_ONLY = {"/users", "/save-user-level"}
-_MUTATING_GET = {"/toggle-campaign", "/delete-blocked", "/clear-blocked", "/delete-draft-item", "/clear-draft"}
-_MAX_FORM_BYTES = 1_000_000
-
-
-def _load_session_user(token):
-    try:
-        with common.db() as conn:
-            me = common.get_session_user(conn.cursor(), token)
-        return ("ok", me) if me else ("anon", None)
-    except Exception as e:
-        print("session lookup error:", e)
-        return ("error", None)
-
-
-async def _send_redirect(send, location):
-    await send({"type": "http.response.start", "status": 303,
-                "headers": [(b"location", location.encode("ascii", "ignore")), (b"content-length", b"0")]})
-    await send({"type": "http.response.body", "body": b""})
-
-
-async def _send_text(send, code, text):
-    body = text.encode("utf-8")
-    await send({"type": "http.response.start", "status": code,
-                "headers": [(b"content-type", b"text/plain; charset=utf-8"), (b"content-length", str(len(body)).encode())]})
-    await send({"type": "http.response.body", "body": body})
-
-
-async def _read_body(receive):
-    chunks, size = [], 0
-    while True:
-        msg = await receive()
-        if msg["type"] != "http.request":
-            break
-        part = msg.get("body", b"")
-        size += len(part)
-        if size > _MAX_FORM_BYTES:
-            return None
-        chunks.append(part)
-        if not msg.get("more_body"):
-            break
-    return b"".join(chunks)
-
-
-class SessionAuthMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["path"] in _PUBLIC_PATHS:
-            return await self.app(scope, receive, send)
-        path, method = scope["path"], scope["method"]
-
-        def header(name):
-            for k, v in scope["headers"]:
-                if k == name:
-                    return v.decode("latin-1")
-            return ""
-
-        # 1) ตรวจ cookie session
-        cookie = "; ".join(v.decode("latin-1") for k, v in scope["headers"] if k == b"cookie")
-        token = None
-        for part in cookie.split(";"):
-            k, _, v = part.strip().partition("=")
-            if k == common.SESSION_COOKIE:
-                token = v
-        state, me = await asyncio.get_running_loop().run_in_executor(None, _load_session_user, token)
-        if state == "error":
-            return await _send_text(send, 503, "ระบบฐานข้อมูลไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่อีกครั้ง")
-        if state == "anon":
-            return await _send_redirect(send, "/login?" + urlencode({"error": "กรุณาเข้าสู่ระบบ"}))
-
-        # 2) กันคำขอข้ามเว็บไซต์ (CSRF) — เบราว์เซอร์สมัยใหม่ส่ง Sec-Fetch-Site มาให้
-        if header(b"sec-fetch-site") == "cross-site" and (method not in ("GET", "HEAD") or path in _MUTATING_GET):
-            return await _send_text(send, 403, "คำขอถูกปฏิเสธ (cross-site)")
-
-        # 3) สิทธิ์ตามบทบาท
-        role, uname = me["role"], me["username"]
-        if (path in _ADMIN_ONLY and role != "Admin") or (path in _MANAGER_ONLY and role not in common.MANAGER_ROLES):
-            return await _send_redirect(send, "/campaigns?" + urlencode({"user": uname, "error": "คุณไม่มีสิทธิ์ใช้งานส่วนนี้"}))
-
-        # 4) เขียนทับ user / username ด้วยชื่อจาก session
-        scope = dict(scope)
-        qs = parse_qsl(scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True)
-        qs = [(k, v) for k, v in qs if k not in ("user", "username")] + [("user", uname)]
-        scope["query_string"] = urlencode(qs).encode("ascii")
-
-        if method == "POST" and header(b"content-type").lower().startswith("application/x-www-form-urlencoded"):
-            body = await _read_body(receive)
-            if body is None:
-                return await _send_text(send, 413, "ข้อมูลที่ส่งมามีขนาดใหญ่เกินไป")
-            pairs = parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True)
-            pairs = [(k, v) for k, v in pairs if k not in ("user", "username")] + [("user", uname), ("username", uname)]
-            new_body = urlencode(pairs).encode("ascii")
-            scope["headers"] = [(k, v) for k, v in scope["headers"] if k != b"content-length"] + \
-                               [(b"content-length", str(len(new_body)).encode())]
-            sent = {"done": False}
-
-            async def replay():
-                if not sent["done"]:
-                    sent["done"] = True
-                    return {"type": "http.request", "body": new_body, "more_body": False}
-                return await receive()
-
-            return await self.app(scope, replay, send)
-        return await self.app(scope, receive, send)
-
-
-app.add_middleware(SessionAuthMiddleware)
-
+    return datetime.utcnow() + timedelta(hours=7)
 
 @app.on_event("startup")
 def startup_db():
     try:
-        common.run_migrations()
+        conn = connect_db()
+        c = conn.cursor()
+        
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS Customers (
+                id SERIAL PRIMARY KEY,
+                name TEXT,
+                owner_username TEXT,
+                discount_type INTEGER DEFAULT 1,
+                disc_total NUMERIC DEFAULT 0,
+                disc_3d NUMERIC DEFAULT 0,
+                disc_2d NUMERIC DEFAULT 0,
+                pay_3d NUMERIC DEFAULT 500,
+                pay_3tod NUMERIC DEFAULT 100,
+                pay_2d NUMERIC DEFAULT 70
+            );
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS LotteryCampaigns (
+                id SERIAL PRIMARY KEY,
+                lotto_name TEXT,
+                draw_date TEXT,
+                status TEXT DEFAULT 'Active',
+                close_time TEXT
+            );
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS BlockedNumbers (
+                id SERIAL PRIMARY KEY,
+                draw_date TEXT,
+                raw_num TEXT,
+                status TEXT,
+                type TEXT
+            );
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS TempDraft (
+                id SERIAL PRIMARY KEY,
+                username TEXT,
+                customer_id TEXT,
+                customer_type TEXT,
+                num TEXT,
+                amt_teng NUMERIC DEFAULT 0,
+                amt_tod NUMERIC DEFAULT 0,
+                type TEXT,
+                payout_rate NUMERIC DEFAULT 0,
+                discount NUMERIC DEFAULT 0,
+                net NUMERIC DEFAULT 0,
+                status TEXT DEFAULT 'ปกติ'
+            );
+        """)
+        conn.commit()
+
+        migrations = [
+            "ALTER TABLE BlockedNumbers ADD COLUMN IF NOT EXISTS is_raw BOOLEAN DEFAULT FALSE;",
+            "ALTER TABLE TempDraft ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ปกติ';",
+            "ALTER TABLE TempDraft ADD COLUMN IF NOT EXISTS amt_teng NUMERIC DEFAULT 0;",
+            "ALTER TABLE TempDraft ADD COLUMN IF NOT EXISTS amt_tod NUMERIC DEFAULT 0;",
+            "ALTER TABLE TempDraft ADD COLUMN IF NOT EXISTS payout_rate NUMERIC DEFAULT 0;",
+            "ALTER TABLE TempDraft ADD COLUMN IF NOT EXISTS discount NUMERIC DEFAULT 0;",
+            "ALTER TABLE TempDraft ADD COLUMN IF NOT EXISTS net NUMERIC DEFAULT 0;",
+            "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS disc_3d NUMERIC DEFAULT 0;",
+            "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS disc_2d NUMERIC DEFAULT 0;",
+            "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS disc_total NUMERIC DEFAULT 0;",
+            "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS disc_run NUMERIC DEFAULT 0;",
+            "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS pay_run_top NUMERIC DEFAULT 3;",
+            "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS pay_run_bot NUMERIC DEFAULT 4;",
+            "ALTER TABLE Users ADD COLUMN IF NOT EXISTS disc_total NUMERIC DEFAULT 0;",
+            "ALTER TABLE Users ADD COLUMN IF NOT EXISTS disc_3d NUMERIC DEFAULT 0;",
+            "ALTER TABLE Users ADD COLUMN IF NOT EXISTS disc_2d NUMERIC DEFAULT 0;",
+            "ALTER TABLE Users ADD COLUMN IF NOT EXISTS disc_run NUMERIC DEFAULT 0;",
+            "ALTER TABLE Users ADD COLUMN IF NOT EXISTS pay_3d NUMERIC DEFAULT 500;",
+            "ALTER TABLE Users ADD COLUMN IF NOT EXISTS pay_3tod NUMERIC DEFAULT 100;",
+            "ALTER TABLE Users ADD COLUMN IF NOT EXISTS pay_2d NUMERIC DEFAULT 70;",
+            "ALTER TABLE Users ADD COLUMN IF NOT EXISTS pay_run_top NUMERIC DEFAULT 3;",
+            "ALTER TABLE Users ADD COLUMN IF NOT EXISTS pay_run_bot NUMERIC DEFAULT 4;",
+            "ALTER TABLE LotteryCampaigns ADD COLUMN IF NOT EXISTS close_time TEXT;",
+            "ALTER TABLE LotteryCampaigns ALTER COLUMN close_time TYPE TEXT USING close_time::text;",
+            "ALTER TABLE LotteryCampaigns ADD COLUMN IF NOT EXISTS result_timestamp TEXT;"
+        ]
+        for mig in migrations:
+            try:
+                c.execute(mig)
+                conn.commit()
+            except:
+                conn.rollback()
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS Transactions (
+                id SERIAL PRIMARY KEY,
+                draw_date TEXT,
+                timestamp TEXT,
+                username TEXT,
+                customer_id INTEGER,
+                customer_name TEXT,
+                customer_type TEXT,
+                bill_no TEXT,
+                num TEXT,
+                type TEXT,
+                amount NUMERIC DEFAULT 0,
+                status TEXT,
+                discount NUMERIC DEFAULT 0,
+                net NUMERIC DEFAULT 0,
+                payout_rate NUMERIC DEFAULT 0,
+                lotto_name TEXT
+            );
+        """)
+        try:
+            c.execute("ALTER TABLE Transactions ADD COLUMN IF NOT EXISTS lotto_name TEXT;")
+            conn.commit()
+        except:
+            conn.rollback()
+            
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS DrawResults (
+                id SERIAL PRIMARY KEY,
+                draw_date TEXT UNIQUE,
+                prize_1 TEXT,
+                bottom_2 TEXT
+            );
+        """)
+        conn.commit()
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS CustomerLottoRates (
+                id SERIAL PRIMARY KEY,
+                customer_id INT REFERENCES Customers(id) ON DELETE CASCADE,
+                lotto_name VARCHAR(100) NOT NULL,
+                pay_3d NUMERIC(10,2) DEFAULT 500,
+                pay_3tod NUMERIC(10,2) DEFAULT 100,
+                pay_2d NUMERIC(10,2) DEFAULT 70,
+                pay_run_top NUMERIC(10,2) DEFAULT 3.2,
+                pay_run_bot NUMERIC(10,2) DEFAULT 4.2,
+                disc_3d NUMERIC(5,2) DEFAULT 0,
+                disc_2d NUMERIC(5,2) DEFAULT 0,
+                disc_run NUMERIC(5,2) DEFAULT 0,
+                disc_total NUMERIC(5,2) DEFAULT 0,
+                UNIQUE(customer_id, lotto_name)
+            );
+        """)
+        conn.commit()
+        conn.close()
     except Exception as e:
         print("Startup DB Init Warning:", e)
 
 # ================= Helper Functions =================
 
-def split_draw(draw):
-    """'หวยลาว งวด 16 ตุลาคม 2026' -> ('หวยลาว', '16 ตุลาคม 2026')   ถ้าไม่มีคำว่า งวด -> ('', draw)"""
-    draw = (draw or "").strip()
-    if " งวด " in draw:
-        name, d = draw.split(" งวด ", 1)
-        return name.strip(), d.strip()
-    if "งวด " in draw:
-        return "", draw.split("งวด ", 1)[1].strip()
-    return "", draw
+def extract_date_to_string(draw_date):
+    nums = re.findall(r'\d+', draw_date)
+    if len(nums) >= 3:
+        d = str(nums[0]).zfill(2)
+        m = str(nums[1]).zfill(2)
+        y = str(nums[2])[-2:]
+        return f"{d}{m}{y}"
+    elif len(nums) >= 2:
+        return f"{nums[0].zfill(2)}{nums[1].zfill(2)}XX"
+    return get_thai_time().strftime("%d%m%y")
 
-
-def parse_selected(selected):
-    """'12|ชื่อ|Customer' -> ('12', 'ชื่อ', 'Customer') หรือ None ถ้ารูปแบบผิด"""
-    parts = (selected or "").split("|")
-    if len(parts) < 3 or parts[2] not in ("Customer", "User") or not parts[0].isdigit():
-        return None
-    return parts[0], parts[1], parts[2]
-
-
-def back_to_buy(user, draw, selected, **kw):
-    q = {"user": user, "draw": draw, "selected": selected}
-    q.update({k: v for k, v in kw.items() if v})
-    return RedirectResponse(url="/buy?" + urlencode(q), status_code=303)
-
-
-def can_use_target(c, user, role, c_id, c_type):
-    """ผู้ใช้คนนี้บันทึกโพยให้ลูกค้า/สายงานรายนี้ได้ไหม (กันแก้ค่าในฟอร์มไปใช้ของคนอื่น)"""
+def generate_bill_no(lotto_name, draw_date, c_id):
+    l_name = str(lotto_name).lower() if lotto_name else ""
+    if 'รัฐบาล' in l_name or 'ไทย' in l_name: prefix = 'TH'
+    elif 'ลาว' in l_name: prefix = 'LO'
+    elif 'ฮานอย' in l_name or 'เวียดนาม' in l_name: prefix = 'HN'
+    elif 'มาเลย์' in l_name: prefix = 'MY'
+    elif 'หุ้น' in l_name: prefix = 'ST'
+    elif 'ยี่กี' in l_name or 'ปิงปอง' in l_name: prefix = 'YG'
+    else: prefix = 'OT'
+    
+    date_part = extract_date_to_string(draw_date)
+    
     try:
-        cid = int(c_id)
-    except (TypeError, ValueError):
-        return False
-    if c_type == "Customer":
-        if role == "Admin":
-            c.execute("SELECT 1 FROM Customers WHERE id=%s", (cid,))
-        else:
-            c.execute("SELECT 1 FROM Customers WHERE id=%s AND LOWER(owner_username)=LOWER(%s)", (cid, user))
-    elif c_type == "User":
-        if role == "Admin":
-            c.execute("SELECT 1 FROM Users WHERE id=%s", (cid,))
-        else:
-            c.execute("SELECT 1 FROM Users WHERE id=%s AND (LOWER(parent_user)=LOWER(%s) OR username=%s)", (cid, user, user))
-    else:
-        return False
-    return bool(c.fetchone())
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(DISTINCT bill_no) FROM Transactions WHERE customer_id=%s AND (draw_date=%s OR draw_date ILIKE %s)", (c_id, draw_date, f"%{draw_date}%"))
+        count = c.fetchone()[0]
+        conn.close()
+    except:
+        count = 0
+        
+    seq = f"{count + 1:02d}"
+    return f"{prefix}{date_part}-{c_id}-B{seq}"
 
-
-def get_blocked_display_data(draw_date, lotto_name=None):
+def get_all_blocked_for_draw(draw_date):
     try:
-        with common.db() as conn:
-            return common.get_blocked_display(conn.cursor(), lotto_name or "", draw_date)
-    except Exception as e:
-        print("get_blocked_display_data error:", e)
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute("SELECT raw_num, status FROM BlockedNumbers WHERE (draw_date = %s OR draw_date ILIKE %s)", (draw_date, f"%{draw_date}%"))
+        rows = c.fetchall()
+        conn.close()
+        return {str(r[0]).strip(): str(r[1]) for r in rows if r[0]}
+    except:
+        return {}
+
+def get_blocked_display_data(draw_date):
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute("SELECT raw_num, status, type FROM BlockedNumbers WHERE (draw_date = %s OR draw_date ILIKE %s) AND is_raw = TRUE", (draw_date, f"%{draw_date}%"))
+        rows = c.fetchall()
+        if not rows:
+            c.execute("SELECT raw_num, status, type FROM BlockedNumbers WHERE (draw_date = %s OR draw_date ILIKE %s)", (draw_date, f"%{draw_date}%"))
+            rows = c.fetchall()
+        conn.close()
+        l_c, l_3, l_2 = [], [], []
+        seen_c, seen_3, seen_2 = set(), set(), set()
+        for r_num, status_val, type_val in rows:
+            if not r_num: continue
+            num_str = str(r_num).strip()
+            if status_val == "ปิดรับ":
+                if num_str not in seen_c:
+                    seen_c.add(num_str)
+                    l_c.append(num_str)
+            else:
+                if len(num_str) == 3 or type_val == "3ตัว":
+                    if num_str not in seen_3:
+                        seen_3.add(num_str)
+                        l_3.append(num_str)
+                elif len(num_str) == 2 or type_val == "2ตัว":
+                    if num_str not in seen_2:
+                        seen_2.add(num_str)
+                        l_2.append(num_str)
+        return ", ".join(l_c), ", ".join(l_3), ", ".join(l_2)
+    except:
         return "", "", ""
 
-
-def get_current_campaign_close_time(draw_date, lotto_name=None):
-    if not draw_date or draw_date == "เลือกงวด":
-        return None
+def check_number_blocked_status(draw_date, num_str):
     try:
-        with common.db() as conn:
-            c = conn.cursor()
-            like = f"%{common.like_escape(draw_date)}%"
-            if lotto_name:
-                c.execute("SELECT close_time FROM LotteryCampaigns WHERE lotto_name=%s AND (draw_date = %s OR draw_date ILIKE %s) "
-                          "ORDER BY id DESC LIMIT 1", (lotto_name, draw_date, like))
-            else:
-                c.execute("SELECT close_time FROM LotteryCampaigns WHERE draw_date = %s OR draw_date ILIKE %s "
-                          "ORDER BY id DESC LIMIT 1", (draw_date, like))
-            res = c.fetchone()
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute("SELECT status FROM BlockedNumbers WHERE (draw_date = %s OR draw_date ILIKE %s) AND raw_num = %s", (draw_date, f"%{draw_date}%", num_str))
+        res = c.fetchone()
+        conn.close()
+        if res: return res[0]
+        return "ปกติ"
+    except:
+        return "ปกติ"
+
+def get_current_campaign_close_time(draw_date):
+    if not draw_date or draw_date == "เลือกงวด": return None
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute("SELECT close_time FROM LotteryCampaigns WHERE draw_date = %s OR draw_date ILIKE %s", (draw_date, f"%{draw_date}%"))
+        res = c.fetchone()
+        conn.close()
         return res[0] if res and res[0] else None
-    except Exception:
+    except:
         return None
 
 # ================= HTML Templates =================
@@ -326,15 +340,15 @@ LAYOUT = """
             Lotto ERP | งวด: <span class="text-white">{{ draw_date }}</span> | User: <b>{{ username }} ({{ role }})</b>
         </div>
         <div class="top-nav-links">
-            <a href="/dashboard?user={{ username }}&draw={{ draw_date|urlencode }}">📊 แดชบอร์ด</a>
-            <a href="/buy?user={{ username }}&draw={{ draw_date|urlencode }}">🛒 บันทึกโพย</a>
+            <a href="/dashboard?user={{ username }}&draw={{ draw_date }}">📊 แดชบอร์ด</a>
+            <a href="/buy?user={{ username }}&draw={{ draw_date }}">🛒 บันทึกโพย</a>
             {% if role == 'Admin' %}
-            <a href="/audit-all?user={{ username }}&draw={{ draw_date|urlencode }}">🔍 ตรวจสอบทั้งหมด</a>
-            <a href="/results?user={{ username }}&draw={{ draw_date|urlencode }}">🏆 ออกผลรางวัล</a>
-            <a href="/db-inspector?user={{ username }}&draw={{ draw_date|urlencode }}">🗄️ ตรวจสอบ DB</a>
+            <a href="/audit-all?user={{ username }}&draw={{ draw_date }}">🔍 ตรวจสอบทั้งหมด</a>
+            <a href="/results?user={{ username }}&draw={{ draw_date }}">🏆 ออกผลรางวัล</a>
+            <a href="/db-inspector?user={{ username }}&draw={{ draw_date }}">🗄️ ตรวจสอบ DB</a>
             {% endif %}
-            <a href="/password?user={{ username }}&draw={{ draw_date|urlencode }}">⚙ ตั้งค่าเริ่มต้น</a>
-            <a href="/customers?user={{ username }}&draw={{ draw_date|urlencode }}">👥 จัดการลูกค้า</a>
+            <a href="/password?user={{ username }}&draw={{ draw_date }}">⚙ ตั้งค่าเริ่มต้น</a>
+            <a href="/customers?user={{ username }}&draw={{ draw_date }}">👥 จัดการลูกค้า</a>
         </div>
         <div class="d-flex align-items-center gap-3">
             <span id="live-clock" class="text-info fw-bold font-monospace">กำลังโหลด...</span>
@@ -360,14 +374,14 @@ LAYOUT = """
 
             <div class="sidebar-section-title">จัดการผู้ใช้</div>
             {% if role == 'Admin' %}
-                <a href="/users?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">▶ Master</a>
-                <a href="/users?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">▶ เอเย่นต์</a>
-                <a href="/users?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">▶ สมาชิก</a>
+                <a href="/users?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">▶ Master</a>
+                <a href="/users?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">▶ เอเย่นต์</a>
+                <a href="/users?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">▶ สมาชิก</a>
             {% elif role == 'Master Agent' %}
-                <a href="/users?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">▶ เอเย่นต์</a>
-                <a href="/users?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">▶ สมาชิก</a>
+                <a href="/users?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">▶ เอเย่นต์</a>
+                <a href="/users?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">▶ สมาชิก</a>
             {% elif role == 'Agent' %}
-                <a href="/users?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">▶ สมาชิก</a>
+                <a href="/users?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">▶ สมาชิก</a>
             {% endif %}
 
             <div class="sidebar-section-title">ตั้งค่าเรตพิเศษ</div>
@@ -375,22 +389,21 @@ LAYOUT = """
                 ⚙️ เรตลูกค้าแยกตามหวย
             </a>
 
-{% if role == 'Admin' %}
-            <a href="/system-reset?user={{ username }}" class="btn btn-outline-danger btn-sm fw-bold mt-2">
+<!-- นำปุ่มนี้ไปแทรกไว้ในหน้าเมนูหรือหน้าเลือกตลาดของ Admin -->
+            <a href="/system-reset?user={{ username }}" class="btn btn-outline-danger btn-sm fw-bold">
                 ⚠️ รีเซ็ตระบบ (Go-Live)
             </a>
-            {% endif %}
 
             <div class="sidebar-section-title">แทงหวย</div>
             <a href="/campaigns?user={{ username }}" class="sidebar-menu-item text-warning fw-bold">▶ จัดการและเลือกงวดหวย</a>
             {% if role == 'Admin' %}
-            <a href="/blocked-numbers?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">🚫 จัดการเลขอั้น</a>
+            <a href="/blocked-numbers?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">🚫 จัดการเลขอั้น</a>
             {% endif %}
 
             <div class="sidebar-section-title">รายงานและเครื่องมือ</div>
-            <a href="/results?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">▶ ชนะ แพ้ (รายละเอียด)</a>
-            <a href="/reports?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">▶ รายงานยอดขาย</a>
-            <a href="/audit-discount?user={{ username }}&draw={{ draw_date|urlencode }}" class="sidebar-menu-item">🔍 ตรวจสอบส่วนลดลูกค้า</a>
+            <a href="/results?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">▶ ชนะ แพ้ (รายละเอียด)</a>
+            <a href="/reports?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">▶ รายงานยอดขาย</a>
+            <a href="/audit-discount?user={{ username }}&draw={{ draw_date }}" class="sidebar-menu-item">🔍 ตรวจสอบส่วนลดลูกค้า</a>
         </div>
 
         <div class="content-area">
@@ -473,7 +486,7 @@ SYSTEM_RESET_TEMPLATE = """
                 <button type="submit" class="btn btn-danger btn-lg fw-bold py-3">
                     <i class="fa-solid fa-bomb"></i> ยืนยันล้างข้อมูลและรีเซ็ตระบบทั้งหมด
                 </button>
-                <a href="/campaigns?user={{ username }}" class="btn btn-outline-secondary btn-lg fw-bold py-2">
+                <a href="/select-market?user={{ username }}" class="btn btn-outline-secondary btn-lg fw-bold py-2">
                     ❌ ยกเลิกและกลับสู่หน้าหลัก
                 </a>
             </div>
@@ -495,9 +508,9 @@ def system_reset_page(user: str, error: str = None):
         
         role = res[0] if res else ""
         if role != 'Admin':
-            return RedirectResponse(url=f"/campaigns?user={_q(user)}", status_code=303)
+            return RedirectResponse(url=f"/select-market?user={user}", status_code=303)
     except:
-        return RedirectResponse(url=f"/campaigns?user={_q(user)}", status_code=303)
+        return RedirectResponse(url=f"/select-market?user={user}", status_code=303)
 
     return Template(SYSTEM_RESET_TEMPLATE).render(username=user, error=error)
 
@@ -506,27 +519,36 @@ def execute_system_reset(username: str = Form(...), admin_password: str = Form(.
     try:
         conn = connect_db()
         c = conn.cursor()
-
-        # 1. ตรวจสอบรหัสผ่านของ Admin (username มาจาก session เท่านั้น)
-        c.execute("SELECT password FROM Users WHERE username=%s AND role='Admin'", (username,))
-        row = c.fetchone()
-        if not row or not common.verify_password(row[0], admin_password):
+        
+        # 1. ตรวจสอบรหัสผ่านของ Admin เพื่อความปลอดภัยสูงสุด
+        c.execute("SELECT id FROM Users WHERE username=%s AND password=%s AND role='Admin'", (username, admin_password))
+        admin_check = c.fetchone()
+        
+        if not admin_check:
             conn.close()
-            return RedirectResponse(url="/system-reset?" + urlencode({"user": username, "error": "รหัสผ่าน Admin ไม่ถูกต้อง ไม่สามารถรีเซ็ตระบบได้!"}), status_code=303)
+            return RedirectResponse(url=f"/system-reset?user={username}&error=รหัสผ่าน Admin ไม่ถูกต้อง ไม่สามารถรีเซ็ตระบบได้!", status_code=303)
 
-        # 2. เคลียร์ข้อมูลทั้งหมด (ลำดับสำคัญ: ตารางที่อ้างอิง Customers ลบก่อน)
-        for tbl in ("Transactions", "TempDraft", "BlockedNumbers", "CustomerLottoRates", "AgentSettlements",
-                    "DrawResults", "Customers", "LotteryCampaigns"):
-            c.execute(f"DELETE FROM {tbl};")
-
-        # 3. ลบ Users ทั้งหมด ยกเว้นบัญชี Admin ที่กำลังใช้งาน
+        # 2. ทำการเคลียร์ข้อมูลในตารางต่างๆ ออกทั้งหมด
+        c.execute("DELETE FROM Transactions;")
+        c.execute("DELETE FROM TempDraft;")
+        c.execute("DELETE FROM BlockedNumbers;")
+        c.execute("DELETE FROM CustomerLottoRates;")
+        c.execute("DELETE FROM AgentSettlements;")
+        c.execute("DELETE FROM DrawResults;")
+        c.execute("DELETE FROM Customers;")
+        c.execute("DELETE FROM LotteryCampaigns;")
+        
+        # 3. ลบ Users ทั้งหมด ยกเว้นบัญชี Admin ปัจจุบัน
         c.execute("DELETE FROM Users WHERE username != %s;", (username,))
+        
         conn.commit()
         conn.close()
-        return RedirectResponse(url="/login?" + urlencode({"error": "รีเซ็ตระบบสำเร็จ! ข้อมูลถูกล้างเรียบร้อยพร้อมเริ่มใช้งานจริงแล้ว"}), status_code=303)
+        
+        # รีเซ็ตสำเร็จ เด้งกลับไปหน้า Login พร้อมข้อความ
+        return RedirectResponse(url="/login?error=รีเซ็ตระบบสำเร็จ! ข้อมูลถูกล้างเกลี้ยงพร้อมเริ่มใช้งานจริงแล้ว กรุณาเข้าสู่ระบบใหม่อีกครั้ง", status_code=303)
+        
     except Exception as e:
-        print("system reset error:", e)
-        return RedirectResponse(url="/system-reset?" + urlencode({"user": username, "error": "เกิดข้อผิดพลาดในการรีเซ็ต ข้อมูลไม่ถูกเปลี่ยนแปลง"}), status_code=303)
+        return RedirectResponse(url=f"/system-reset?user={username}&error=เกิดข้อผิดพลาดในการรีเซ็ต: {str(e)}", status_code=303)
 
 CAMPAIGN_TEMPLATE = """
 <div class="container my-3" style="max-width: 900px;">
@@ -627,7 +649,7 @@ CAMPAIGN_TEMPLATE = """
                                     <img src="{{ img_url }}" alt="lotto-logo" style="width: 100%; height: 100%; object-fit: cover;">
                                 </div>
                                 <div>
-                                    <a href="/buy?user={{ username }}&draw={{ (camp['lotto_name'] ~ ' งวด ' ~ camp['draw_date'])|urlencode }}" class="text-primary text-decoration-none fs-5 fw-bold">
+                                    <a href="/buy?user={{ username }}&draw={{ camp['lotto_name'] }} งวด {{ camp['draw_date'] }}" class="text-primary text-decoration-none fs-5 fw-bold">
                                         {{ camp['lotto_name'] }} งวดวันที่ {{ camp['draw_date'] }}
                                     </a>
                                     <div class="small text-muted mt-1">
@@ -664,7 +686,7 @@ CAMPAIGN_TEMPLATE = """
                             <div class="d-flex align-items-center opacity-75">
                                 <div class="fs-1 me-3 text-secondary"><i class="fa-solid fa-box-archive"></i></div>
                                 <div>
-                                    <a href="/buy?user={{ username }}&draw={{ (camp['lotto_name'] ~ ' งวด ' ~ camp['draw_date'])|urlencode }}" class="text-secondary text-decoration-none fs-5 fw-bold">
+                                    <a href="/buy?user={{ username }}&draw={{ camp['lotto_name'] }} งวด {{ camp['draw_date'] }}" class="text-secondary text-decoration-none fs-5 fw-bold">
                                         {{ camp['lotto_name'] }} งวดวันที่ {{ camp['draw_date'] }}
                                     </a>
                                     <div class="small mt-1">
@@ -702,7 +724,7 @@ BLOCKED_TEMPLATE = """
                     <div class="mb-3"><label class="form-label fw-bold">หมายเลขเลขอั้น:</label><input type="text" name="raw_num" class="form-control" value="{{ edit_blocked[2] }}" required></div>
                     <div class="mb-3"><label class="form-label fw-bold">สถานะ:</label><select name="status" class="form-select"><option value="ปิดรับ" {% if edit_blocked[3] == 'ปิดรับ' %}selected{% endif %}>ปิดรับ</option><option value="จ่ายครึ่ง" {% if edit_blocked[3] == 'จ่ายครึ่ง' %}selected{% endif %}>จ่ายครึ่ง</option></select></div>
                     <button type="submit" class="btn btn-warning w-100 fw-bold mb-2">💾 บันทึก</button>
-                    <a href="/blocked-numbers?user={{ username }}&draw={{ draw_date|urlencode }}" class="btn btn-outline-secondary w-100 fw-bold">ยกเลิก</a>
+                    <a href="/blocked-numbers?user={{ username }}&draw={{ draw_date }}" class="btn btn-outline-secondary w-100 fw-bold">ยกเลิก</a>
                 </form>
             {% else %}
                 <h4 class="text-danger mb-3 fw-bold">🚫 นำเข้าเลขอั้น</h4>
@@ -721,7 +743,7 @@ BLOCKED_TEMPLATE = """
             <div class="d-flex justify-content-between align-items-center mb-3">
                 <h4 class="text-primary mb-0 fw-bold">📋 รายการเลขอั้นงวดนี้</h4>
                 {% if blocked_list %}
-                <a href="/clear-blocked?user={{ username }}&draw={{ draw_date|urlencode }}" class="btn btn-outline-danger btn-sm fw-bold" onclick="return confirm('⚠️ ล้างข้อมูลทั้งหมด?')">🗑️ ล้างข้อมูลเลขอั้น</a>
+                <a href="/clear-blocked?user={{ username }}&draw={{ draw_date }}" class="btn btn-outline-danger btn-sm fw-bold" onclick="return confirm('⚠️ ล้างข้อมูลทั้งหมด?')">🗑️ ล้างข้อมูลเลขอั้น</a>
                 {% endif %}
             </div>
             <div class="table-responsive" style="max-height: 500px; overflow-y: auto;">
@@ -733,7 +755,7 @@ BLOCKED_TEMPLATE = """
                         {% for b in blocked_list %}
                         <tr>
                             <td>{{ b[0] }}</td><td><b class="text-danger fs-6">{{ b[2] }}</b></td><td><span class="badge {% if b[3] == 'ปิดรับ' %}bg-danger{% else %}bg-warning text-dark{% endif %}">{{ b[3] }}</span></td><td>{{ b[4] }}</td>
-                            <td><a href="/blocked-numbers?user={{ username }}&draw={{ draw_date|urlencode }}&edit_id={{ b[0] }}" class="btn btn-warning btn-sm py-0 px-1 fw-bold">✏️</a> <a href="/delete-blocked?id={{ b[0] }}&user={{ username }}&draw={{ draw_date|urlencode }}" class="btn btn-outline-danger btn-sm py-0 px-1 fw-bold">🗑️</a></td>
+                            <td><a href="/blocked-numbers?user={{ username }}&draw={{ draw_date }}&edit_id={{ b[0] }}" class="btn btn-warning btn-sm py-0 px-1 fw-bold">✏️</a> <a href="/delete-blocked?id={{ b[0] }}&user={{ username }}&draw={{ draw_date }}" class="btn btn-outline-danger btn-sm py-0 px-1 fw-bold">🗑️</a></td>
                         </tr>
                         {% endfor %}
                     </tbody>
@@ -799,8 +821,8 @@ BUY_CONTENT = """
                             <td class="text-danger">{{ "{:,.2f}".format(d[6] | float) }}</td><td class="text-success fw-bold">{{ "{:,.2f}".format(d[7] | float) }}</td>
                             <td><span class="badge {% if d[3] == 'ปกติ' %}bg-danger{% else %}bg-warning text-dark{% endif %}">{{ d[3] }}</span></td>
                             <td>
-                                <a href="/edit-draft-item?id={{ d[0] }}&user={{ username }}&draw={{ draw_date|urlencode }}&selected={{ selected_target_raw|urlencode }}" class="text-decoration-none fw-bold me-1">แก้ไข</a>
-                                <a href="/delete-draft-item?id={{ d[0] }}&user={{ username }}&draw={{ draw_date|urlencode }}&selected={{ selected_target_raw|urlencode }}" class="text-danger text-decoration-none fw-bold">ลบ</a>
+                                <a href="/edit-draft-item?id={{ d[0] }}&user={{ username }}&draw={{ draw_date }}&selected={{ selected_target_raw }}" class="text-decoration-none fw-bold me-1">แก้ไข</a>
+                                <a href="/delete-draft-item?id={{ d[0] }}&user={{ username }}&draw={{ draw_date }}&selected={{ selected_target_raw }}" class="text-danger text-decoration-none fw-bold">ลบ</a>
                             </td>
                         </tr>
                         {% else %}
@@ -824,7 +846,7 @@ BUY_CONTENT = """
                     <button type="button" class="btn btn-primary btn-lg w-100 fw-bold" data-bs-toggle="modal" data-bs-target="#billModal"><i class="fa-solid fa-check"></i> ยืนยันโพย (เปิดหน้าต่างบิล)</button>
                 </div>
                 <div class="col-md-6">
-                    <a href="/clear-draft?user={{ username }}&draw={{ draw_date|urlencode }}&selected={{ selected_target_raw|urlencode }}" class="btn btn-outline-danger btn-lg w-100 fw-bold">ยกเลิกรายการร่างทั้งหมด</a>
+                    <a href="/clear-draft?user={{ username }}&draw={{ draw_date }}&selected={{ selected_target_raw }}" class="btn btn-outline-danger btn-lg w-100 fw-bold">ยกเลิกรายการร่างทั้งหมด</a>
                 </div>
             </div>
             {% endif %}
@@ -977,7 +999,7 @@ BILL_PRINT_TEMPLATE = """
     
     <div class="container no-print" style="max-width: 320px; margin: 0 auto;">
         <button onclick="window.print()" class="btn btn-dark btn-print">🖨️ พิมพ์สลิป (Print)</button>
-        <a href="/buy?user={{ username }}&draw={{ draw_date_raw|urlencode }}&selected={{ selected_target_raw|urlencode }}" class="btn btn-primary btn-print">⬅️ กลับไปหน้าซื้อเลข (ลูกค้าเดิม)</a>
+        <a href="/buy?user={{ username }}&draw={{ draw_date_raw }}&selected={{ selected_target_raw }}" class="btn btn-primary btn-print">⬅️ กลับไปหน้าซื้อเลข (ลูกค้าเดิม)</a>
     </div>
 </body>
 </html>
@@ -1095,7 +1117,6 @@ CUSTOMER_CONTENT = """
                     </div>
                     <div class="row mb-3">
                         <div class="col"><label class="form-label small">จ่าย 3ตรง:</label><input type="number" step="0.01" name="pay_3d" class="form-control" value="{{ edit_customer[3] or 500 }}"></div>
-                        <div class="col"><label class="form-label small">จ่าย 3โต๊ด:</label><input type="number" step="0.01" name="pay_3tod" class="form-control" value="{{ edit_customer[4] or 100 }}"></div>
                         <div class="col"><label class="form-label small">จ่าย 2ตัว:</label><input type="number" step="0.01" name="pay_2d" class="form-control" value="{{ edit_customer[5] or 70 }}"></div>
                     </div>
                     <div class="row mb-3">
@@ -1103,7 +1124,7 @@ CUSTOMER_CONTENT = """
                         <div class="col"><label class="form-label small">จ่ายวิ่งล่าง:</label><input type="number" step="0.01" name="pay_run_bot" class="form-control" value="{{ edit_customer[7] or 4 }}"></div>
                     </div>
                     <button type="submit" class="btn btn-warning w-100 fw-bold mb-2">💾 บันทึกแก้ไข</button>
-                    <a href="/customers?user={{ username }}&draw={{ draw_date|urlencode }}" class="btn btn-outline-secondary w-100 fw-bold">ยกเลิก</a>
+                    <a href="/customers?user={{ username }}&draw={{ draw_date }}" class="btn btn-outline-secondary w-100 fw-bold">ยกเลิก</a>
                 </form>
             {% else %}
                 <h4 class="text-success mb-3 fw-bold">➕ เพิ่มลูกค้าใหม่</h4>
@@ -1117,7 +1138,6 @@ CUSTOMER_CONTENT = """
                     </div>
                     <div class="row mb-3">
                         <div class="col"><label class="form-label small">จ่าย 3ตรง:</label><input type="number" step="0.01" name="pay_3d" class="form-control" value="500"></div>
-                    <div class="col"><label class="form-label small">จ่าย 3โต๊ด:</label><input type="number" step="0.01" name="pay_3tod" class="form-control" value="100"></div>
                         <div class="col"><label class="form-label small">จ่าย 2ตัว:</label><input type="number" step="0.01" name="pay_2d" class="form-control" value="70"></div>
                     </div>
                     <div class="row mb-3">
@@ -1141,7 +1161,7 @@ CUSTOMER_CONTENT = """
                         {% for c in customers_list %}
                         <tr>
                             <td>{{ c[0] }}</td><td><b>{{ c[1] }}</b></td><td>{{ c[3] or 500 }}</td><td>{{ c[5] or 70 }}</td><td class="text-success fw-bold">{{ c[6] or 3 }}</td><td class="text-success fw-bold">{{ c[7] or 4 }}</td>
-                            <td><a href="/customers?user={{ username }}&draw={{ draw_date|urlencode }}&edit_id={{ c[0] }}" class="btn btn-warning btn-sm fw-bold">✏️ แก้ไข</a></td>
+                            <td><a href="/customers?user={{ username }}&draw={{ draw_date }}&edit_id={{ c[0] }}" class="btn btn-warning btn-sm fw-bold">✏️ แก้ไข</a></td>
                         </tr>
                         {% endfor %}
                     </tbody>
@@ -1174,7 +1194,6 @@ USERS_CONTENT = """
                 </div>
                 <div class="row mb-3">
                     <div class="col"><label class="form-label small">จ่าย 3ตรง:</label><input type="number" step="0.01" name="pay_3d" class="form-control" value="500"></div>
-                    <div class="col"><label class="form-label small">จ่าย 3โต๊ด:</label><input type="number" step="0.01" name="pay_3tod" class="form-control" value="100"></div>
                     <div class="col"><label class="form-label small">จ่าย 2ตัว:</label><input type="number" step="0.01" name="pay_2d" class="form-control" value="70"></div>
                 </div>
                 <button type="submit" class="btn btn-success w-100 fw-bold py-2">💾 บันทึกสมาชิก</button>
@@ -1376,33 +1395,16 @@ def login_page(error: str = None):
     return Template(LOGIN_TEMPLATE).render(error=error)
 
 @app.post("/login")
-def login_action(request: Request, username: str = Form(...), password: str = Form(...)):
-    key = f"{request.client.host if request.client else '?'}|{username.lower()}"
-    now = time.time()
-    fails = [t for t in _LOGIN_FAILS.get(key, []) if now - t < 300]
-    _LOGIN_FAILS[key] = fails
-    if len(fails) >= 5:
-        return HTMLResponse(Template(LOGIN_TEMPLATE).render(error="ล็อกอินผิดหลายครั้ง กรุณารอ 5 นาทีแล้วลองใหม่"))
+def login_action(username: str = Form(...), password: str = Form(...)):
     try:
         conn = connect_db()
         c = conn.cursor()
-        c.execute("SELECT username, password FROM Users WHERE username=%s", (username,))
+        c.execute("SELECT role FROM Users WHERE username=%s AND password=%s", (username, password))
         res = c.fetchone()
         conn.close()
-    except Exception as e:
-        print("login db error:", e)
-        return HTMLResponse(Template(LOGIN_TEMPLATE).render(error="เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่"))
-    if res and common.verify_password(res[1], password):
-        _LOGIN_FAILS.pop(key, None)
-        resp = RedirectResponse(url="/campaigns?" + urlencode({"user": res[0]}), status_code=303)
-        resp.set_cookie(common.SESSION_COOKIE, common.make_session(res[0]), max_age=common.SESSION_TTL,
-                        httponly=True, samesite="lax", secure=COOKIE_SECURE)
-        return resp
-    fails.append(now)
-    return HTMLResponse(Template(LOGIN_TEMPLATE).render(error="ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง!"))
-
-
-_LOGIN_FAILS = {}
+        if res: return RedirectResponse(url=f"/campaigns?user={username}", status_code=status.HTTP_303_SEE_OTHER)
+        else: return Template(LOGIN_TEMPLATE).render(error="ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง!")
+    except Exception as e: return Template(LOGIN_TEMPLATE).render(error=f"Database Error: {str(e)}")
 
 # ================= Routes หน้าหวยหลัก =================
 
@@ -1464,8 +1466,8 @@ def create_campaign(user: str = Form(...), lotto_name: str = Form(...), draw_dat
         c = conn.cursor()
         c.execute("INSERT INTO LotteryCampaigns (lotto_name, draw_date, status, close_time) VALUES (%s, %s, 'Active', %s)", (lotto_name, draw_date, close_time))
         conn.commit(); conn.close()
-        return RedirectResponse(url=f"/campaigns?user={_q(user)}&msg=สร้างงวดหวยสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
-    except Exception as e: return route_error(e)
+        return RedirectResponse(url=f"/campaigns?user={user}&msg=สร้างงวดหวยสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
 
 @app.post("/update-campaign")
 def update_campaign(user: str = Form(...), campaign_id: int = Form(...), lotto_name: str = Form(...), draw_date: str = Form(...), close_time: str = Form(...)):
@@ -1474,8 +1476,8 @@ def update_campaign(user: str = Form(...), campaign_id: int = Form(...), lotto_n
         c = conn.cursor()
         c.execute("UPDATE LotteryCampaigns SET lotto_name=%s, draw_date=%s, close_time=%s WHERE id=%s", (lotto_name, draw_date, close_time, campaign_id))
         conn.commit(); conn.close()
-        return RedirectResponse(url=f"/campaigns?user={_q(user)}&msg=แก้ไขสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
-    except Exception as e: return route_error(e)
+        return RedirectResponse(url=f"/campaigns?user={user}&msg=แก้ไขสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
 
 @app.get("/toggle-campaign")
 def toggle_campaign(id: int, user: str):
@@ -1489,8 +1491,8 @@ def toggle_campaign(id: int, user: str):
             c.execute("UPDATE LotteryCampaigns SET status=%s, result_timestamp=NULL WHERE id=%s", (new_status, id))
             conn.commit()
         conn.close()
-    except Exception as e: return route_error(e)
-    return RedirectResponse(url=f"/campaigns?user={_q(user)}", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
+    return RedirectResponse(url=f"/campaigns?user={user}", status_code=status.HTTP_303_SEE_OTHER)
 
 # ================= Routes ระบบซื้อ และ เลขอั้น =================
 
@@ -1501,7 +1503,7 @@ def blocked_numbers_page(user: str, draw: str, msg: str = None, error: str = Non
         c = conn.cursor()
         c.execute("SELECT role FROM Users WHERE username=%s", (user,))
         role = c.fetchone()[0]
-        if role != 'Admin': return RedirectResponse(url=f"/buy?user={_q(user)}&draw={_q(draw)}", status_code=status.HTTP_303_SEE_OTHER)
+        if role != 'Admin': return RedirectResponse(url=f"/buy?user={user}&draw={draw}", status_code=status.HTTP_303_SEE_OTHER)
         c.execute("SELECT id, draw_date, raw_num, status, type, is_raw FROM BlockedNumbers WHERE (draw_date = %s OR draw_date ILIKE %s) ORDER BY id DESC", (draw, f"%{draw}%"))
         blocked_list = c.fetchall()
         edit_blocked = None
@@ -1512,56 +1514,43 @@ def blocked_numbers_page(user: str, draw: str, msg: str = None, error: str = Non
         close_t = get_current_campaign_close_time(draw)
         content = Template(BLOCKED_TEMPLATE).render(username=user, draw_date=draw, blocked_list=blocked_list, edit_blocked=edit_blocked)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, msg=msg, error=error, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.post("/save-blocked")
-def save_blocked(user: str = Form(...), draw: str = Form(...), raw_input: str = Form(...),
-                 block_status: str = Form(..., alias="status")):
-    lotto_name, _ = split_draw(draw)
+def save_blocked(user: str = Form(...), draw: str = Form(...), raw_input: str = Form(...), status: str = Form(...)):
     try:
         conn = connect_db()
         c = conn.cursor()
         cleaned = raw_input.replace('\r\n', ',').replace('\n', ',').replace(' ', ',')
         raw_numbers = [item.strip() for item in cleaned.split(',') if item.strip()]
         insert_data, seen = [], set()
-
+        
         for num_str in raw_numbers:
-            if not num_str.isdigit() or len(num_str) > 3:
-                continue
-            t_val = "3ตัว" if len(num_str) == 3 else ("2ตัว" if len(num_str) == 2 else "วิ่ง")
+            t_val = "3ตัว" if len(num_str) == 3 else ("2ตัว" if len(num_str) == 2 else ("วิ่ง" if len(num_str) == 1 else "อื่นๆ"))
             if num_str not in seen:
-                insert_data.append((draw.strip(), num_str, block_status, t_val, True, lotto_name or None))
+                insert_data.append((draw.strip(), num_str, status, t_val, True))
                 seen.add(num_str)
             for p_num in set("".join(p) for p in itertools.permutations(num_str)):
                 if p_num not in seen:
-                    insert_data.append((draw.strip(), p_num, block_status, t_val, False, lotto_name or None))
+                    insert_data.append((draw.strip(), p_num, status, t_val, False))
                     seen.add(p_num)
-
-        if insert_data:
-            c.executemany("INSERT INTO BlockedNumbers (draw_date, raw_num, status, type, is_raw, lotto_name) "
-                          "VALUES (%s, %s, %s, %s, %s, %s)", insert_data)
+                    
+        c.executemany("INSERT INTO BlockedNumbers (draw_date, raw_num, status, type, is_raw) VALUES (%s, %s, %s, %s, %s)", insert_data)
         conn.commit()
         conn.close()
-        return RedirectResponse(url="/blocked-numbers?" + urlencode({"user": user, "draw": draw, "msg": "บันทึกเลขอั้นสำเร็จ"}), status_code=303)
+        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&msg=บันทึกเลขอั้นสำเร็จ", status_code=303)
     except Exception as e:
-        print("ข้อผิดพลาดในการบันทึกเลขอั้น:", e)
-        return RedirectResponse(url="/blocked-numbers?" + urlencode({"user": user, "draw": draw, "error": "บันทึกไม่สำเร็จ"}), status_code=303)
-
+        print("ข้อผิดพลาดในการบันทึกถูกบล็อก:", e)
+        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&error=บันทึกไม่สำเร็จ: {str(e)}", status_code=303)
 @app.post("/update-blocked")
-def update_blocked(user: str = Form(...), draw: str = Form(...), blocked_id: int = Form(...),
-                   raw_num: str = Form(...), block_status: str = Form(..., alias="status")):
+def update_blocked(user: str = Form(...), draw: str = Form(...), blocked_id: int = Form(...), raw_num: str = Form(...), status: str = Form(...)):
     try:
-        conn = connect_db()
-        c = conn.cursor()
-        n = raw_num.strip()
-        t_val = "3ตัว" if len(n) == 3 else ("2ตัว" if len(n) == 2 else ("วิ่ง" if len(n) == 1 else "อื่นๆ"))
-        c.execute("UPDATE BlockedNumbers SET raw_num=%s, status=%s, type=%s, is_raw=TRUE WHERE id=%s",
-                  (n, block_status, t_val, blocked_id))
-        conn.commit()
-        conn.close()
-        return RedirectResponse(url="/blocked-numbers?" + urlencode({"user": user, "draw": draw, "msg": "แก้ไขสำเร็จ"}), status_code=303)
-    except Exception as e:
-        return route_error(e)
+        conn = connect_db(); c = conn.cursor()
+        t_val = "3ตัว" if len(raw_num.strip()) == 3 else ("2ตัว" if len(raw_num.strip()) == 2 else ("วิ่ง" if len(raw_num.strip()) == 1 else "อื่นๆ"))
+        c.execute("UPDATE BlockedNumbers SET raw_num=%s, status=%s, type=%s, is_raw=TRUE WHERE id=%s", (raw_num.strip(), status, t_val, blocked_id))
+        conn.commit(); conn.close()
+        return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}&msg=แก้ไขสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
 
 @app.get("/delete-blocked")
 def delete_blocked(id: int, user: str, draw: str):
@@ -1569,8 +1558,8 @@ def delete_blocked(id: int, user: str, draw: str):
         conn = connect_db(); c = conn.cursor()
         c.execute("DELETE FROM BlockedNumbers WHERE id = %s", (id,))
         conn.commit(); conn.close()
-    except Exception as e: return route_error(e)
-    return RedirectResponse(url=f"/blocked-numbers?user={_q(user)}&draw={_q(draw)}", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
+    return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.get("/clear-blocked")
 def clear_blocked(user: str, draw: str):
@@ -1578,8 +1567,8 @@ def clear_blocked(user: str, draw: str):
         conn = connect_db(); c = conn.cursor()
         c.execute("DELETE FROM BlockedNumbers WHERE draw_date = %s OR draw_date ILIKE %s", (draw, f"%{draw}%"))
         conn.commit(); conn.close()
-    except Exception as e: return route_error(e)
-    return RedirectResponse(url=f"/blocked-numbers?user={_q(user)}&draw={_q(draw)}", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
+    return RedirectResponse(url=f"/blocked-numbers?user={user}&draw={draw}", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.get("/buy", response_class=HTMLResponse)
 def buy_page(user: str, draw: str, selected: str = None, msg: str = None):
@@ -1588,13 +1577,9 @@ def buy_page(user: str, draw: str, selected: str = None, msg: str = None):
         c.execute("SELECT role FROM Users WHERE username=%s", (user,))
         role = c.fetchone()[0]
         draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
-        _ln, _dc = split_draw(draw)
-        if _ln:
-            lotto_name_for_bill, draw_clean = _ln, _dc
-        else:
-            c.execute("SELECT lotto_name FROM LotteryCampaigns WHERE draw_date = %s OR draw_date ILIKE %s LIMIT 1", (draw_clean, f"%{draw_clean}%"))
-            ln_res = c.fetchone()
-            lotto_name_for_bill = ln_res[0] if ln_res else "หวยไม่ระบุ"
+        c.execute("SELECT lotto_name FROM LotteryCampaigns WHERE draw_date = %s OR draw_date ILIKE %s LIMIT 1", (draw_clean, f"%{draw_clean}%"))
+        ln_res = c.fetchone()
+        lotto_name_for_bill = ln_res[0] if ln_res else "หวยไม่ระบุ"
         
         c.execute("SELECT id, name, 'Customer' FROM Customers WHERE owner_username=%s", (user,))
         custs = c.fetchall()
@@ -1611,16 +1596,11 @@ def buy_page(user: str, draw: str, selected: str = None, msg: str = None):
         if selected:
             parts = selected.split('|')
             c_id, customer_name_for_bill, c_type = parts[0], parts[1], parts[2]
-            if not can_use_target(c, user, role, c_id, c_type):
-                return RedirectResponse(url="/buy?" + urlencode({"user": user, "draw": draw}), status_code=303)
-            customer_name_for_bill = common.get_target_name(c, c_type, int(c_id)) or ""
-            preview_bill_no = common.generate_bill_no(c, lotto_name_for_bill, draw_clean, c_type, int(c_id))
+            preview_bill_no = generate_bill_no(lotto_name_for_bill, draw_clean, c_id)
             
         drafts, sum_amt, sum_disc, sum_net = [], 0.0, 0.0, 0.0
         if c_id:
-            c.execute("SELECT id, num, amt_teng, status, type, payout_rate, discount, net FROM TempDraft "
-                      "WHERE username=%s AND customer_id=%s AND customer_type=%s AND lotto_name=%s AND draw_date=%s ORDER BY id",
-                      (user, c_id, c_type, lotto_name_for_bill, draw_clean))
+            c.execute("SELECT id, num, amt_teng, status, type, payout_rate, discount, net FROM TempDraft WHERE username=%s AND customer_id=%s AND customer_type=%s", (user, c_id, c_type))
             for row in c.fetchall():
                 drafts.append(row)
                 sum_amt += float(row[2] or 0)
@@ -1632,248 +1612,142 @@ def buy_page(user: str, draw: str, selected: str = None, msg: str = None):
         recent_transactions = c.fetchall()
         conn.close()
         
-        b_closed, b_3d, b_2d = get_blocked_display_data(draw_clean, lotto_name_for_bill)
-        close_t = get_current_campaign_close_time(draw_clean, lotto_name_for_bill)
+        b_closed, b_3d, b_2d = get_blocked_display_data(draw_clean)
+        close_t = get_current_campaign_close_time(draw_clean)
         curr_time = get_thai_time().strftime("%d/%m/%Y %H:%M")
         content = Template(BUY_CONTENT).render(username=user, draw_date=draw, draw_date_clean=draw_clean, customers=all_targets, selected_target_raw=selected, drafts=drafts, draft_totals={"sum_amt": sum_amt, "sum_disc": sum_disc, "sum_net": sum_net}, block_closed=b_closed, block_3d=b_3d, block_2d=b_2d, recent_transactions=recent_transactions, lotto_name_for_bill=lotto_name_for_bill, customer_name_for_bill=customer_name_for_bill, preview_bill_no=preview_bill_no, preview_time=curr_time)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, msg=msg, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.post("/add-draft")
-def add_draft(user: str = Form(...), draw: str = Form(...), customer_info: str = Form(...),
-              col_num: str = Form(None), col_teng: float = Form(0), col_tod: float = Form(0),
-              raw_input: str = Form(None)):
-    sel = parse_selected(customer_info)
-    if not sel:
-        return back_to_buy(user, draw, "", msg="ไม่ได้เลือกลูกค้า / สายงาน")
-    c_id, _name, c_type = sel
-    lotto_name, draw_clean = split_draw(draw)
-    key = common.target_key(c_type, int(c_id))
-    rows, rejected, invalid = [], [], []
-    conn = connect_db()
+def add_draft(user: str = Form(...), draw: str = Form(...), customer_info: str = Form(...), col_num: str = Form(None), col_teng: float = Form(0), col_tod: float = Form(0), raw_input: str = Form(None)):
+    parts = customer_info.split('|')
+    c_id, c_type = parts[0], parts[2]
+    draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
     try:
-        c = conn.cursor()
-        role = (common.get_user(c, user) or {}).get("role", "Member")
-        if not can_use_target(c, user, role, c_id, c_type):
-            return back_to_buy(user, draw, customer_info, msg="คุณไม่มีสิทธิ์บันทึกโพยให้ผู้ซื้อรายนี้")
-        if not lotto_name:
-            c.execute("SELECT lotto_name FROM LotteryCampaigns WHERE draw_date=%s OR draw_date ILIKE %s ORDER BY id DESC LIMIT 1",
-                      (draw_clean, f"%{common.like_escape(draw_clean)}%"))
-            r = c.fetchone()
-            lotto_name = r[0] if r else ""
-        # เช็คสถานะงวด/เวลาปิดรับ ฝั่งเซิร์ฟเวอร์
-        c.execute("SELECT status, close_time FROM LotteryCampaigns WHERE lotto_name=%s AND (draw_date=%s OR draw_date ILIKE %s) "
-                  "ORDER BY id DESC LIMIT 1", (lotto_name, draw_clean, f"%{common.like_escape(draw_clean)}%"))
-        camp = c.fetchone()
-        if camp:
-            ok, reason = common.campaign_open({"status": camp[0], "close_time": camp[1]})
-            if not ok:
-                return back_to_buy(user, draw, customer_info, msg=reason)
-        rates, _src = common.get_rates(c, key, lotto_name)
-        if not rates:
-            return back_to_buy(user, draw, customer_info, msg="ไม่พบเรตของผู้ซื้อรายนี้")
-        blocked = common.get_blocked_map(c, lotto_name, draw_clean)
+        conn = connect_db(); c = conn.cursor()
+        blocked_dict = get_all_blocked_for_draw(draw_clean)
+        table = "Customers" if c_type == 'Customer' else "Users"
+        c.execute(f"SELECT pay_3d, pay_3tod, pay_2d, disc_total, disc_3d, disc_2d, disc_run, pay_run_top, pay_run_bot FROM {table} WHERE id=%s", (c_id,))
+        res = c.fetchone()
+        pay_3d, pay_3tod, pay_2d, disc_total, disc_3d, disc_2d, disc_run, pay_run_top, pay_run_bot = float(res[0] or 500), float(res[1] or 100), float(res[2] or 70), float(res[3] or 0), float(res[4] or 0), float(res[5] or 0), float(res[6] or 0), float(res[7] or 3), float(res[8] or 4)
 
-        def process_number(n, top, bot):
-            if not re.fullmatch(r"[0-9]{1,3}", n) or not (0 <= top <= 1_000_000 and 0 <= bot <= 1_000_000):
-                invalid.append(n)
-                return
-            st = blocked.get(n, "ปกติ")
-            if st == "ปิดรับ":
-                rejected.append(n)
-                return
-            for amt, (ptype, pay_key, kind) in zip((top, bot), common.PLAYS[len(n)]):
-                if amt <= 0:
-                    continue
-                d = round(amt * common.disc_pct(rates, kind) / 100.0, 2)      # ส่วนลดเก็บเป็น "บาท"
-                rows.append((user, str(c_id), c_type, n, amt, ptype, rates[pay_key], d, round(amt - d, 2),
-                             st, lotto_name, draw_clean))
+        insert_data = []
+        def process_number(n_str, top_amt, bot_amt):
+            b_status = blocked_dict.get(n_str, "ปกติ")
+            if len(n_str) == 3:
+                if top_amt > 0: insert_data.append((user, c_id, c_type, n_str, top_amt, "3ตัวตรง", pay_3d, top_amt * ((disc_3d if disc_3d > 0 else disc_total) / 100.0), top_amt - (top_amt * ((disc_3d if disc_3d > 0 else disc_total) / 100.0)), b_status))
+                if bot_amt > 0: insert_data.append((user, c_id, c_type, n_str, bot_amt, "3ตัวโต๊ด", pay_3tod, bot_amt * ((disc_3d if disc_3d > 0 else disc_total) / 100.0), bot_amt - (bot_amt * ((disc_3d if disc_3d > 0 else disc_total) / 100.0)), b_status))
+            elif len(n_str) == 2:
+                if top_amt > 0: insert_data.append((user, c_id, c_type, n_str, top_amt, "2ตัวบน", pay_2d, top_amt * ((disc_2d if disc_2d > 0 else disc_total) / 100.0), top_amt - (top_amt * ((disc_2d if disc_2d > 0 else disc_total) / 100.0)), b_status))
+                if bot_amt > 0: insert_data.append((user, c_id, c_type, n_str, bot_amt, "2ตัวล่าง", pay_2d, bot_amt * ((disc_2d if disc_2d > 0 else disc_total) / 100.0), bot_amt - (bot_amt * ((disc_2d if disc_2d > 0 else disc_total) / 100.0)), b_status))
+            elif len(n_str) == 1:
+                if top_amt > 0: insert_data.append((user, c_id, c_type, n_str, top_amt, "วิ่งบน", pay_run_top, top_amt * ((disc_run if disc_run > 0 else disc_total) / 100.0), top_amt - (top_amt * ((disc_run if disc_run > 0 else disc_total) / 100.0)), b_status))
+                if bot_amt > 0: insert_data.append((user, c_id, c_type, n_str, bot_amt, "วิ่งล่าง", pay_run_bot, bot_amt * ((disc_run if disc_run > 0 else disc_total) / 100.0), bot_amt - (bot_amt * ((disc_run if disc_run > 0 else disc_total) / 100.0)), b_status))
 
-        if col_num and col_num.strip():
-            process_number(col_num.strip(), col_teng, col_tod)
+        if col_num and col_num.strip(): process_number(col_num.strip(), col_teng, col_tod)
         if raw_input and raw_input.strip():
             clean_raw = raw_input.strip().upper().replace(' ', '').replace('X', '*').replace('+', '*').replace('/', '*')
-            hold = []
+            hold_nums = []
             for block in clean_raw.split(','):
-                if not block:
-                    continue
+                if not block: continue
                 if '=' in block:
-                    num_str, amt_str = block.split('=', 1)
-                    num_str = num_str.strip()
-                    if num_str:
-                        hold.append(num_str)
-                    try:
-                        if '*' in amt_str:
-                            a, b = amt_str.split('*', 1)
-                            top, bot = float(a or 0), float(b or 0)
-                        else:
-                            top, bot = float(amt_str or 0), 0.0
-                    except ValueError:
-                        invalid.append(block)
-                        hold = []
-                        continue
-                    for n in hold:
-                        process_number(n, top, bot)
-                    hold = []
-                else:
-                    hold.append(block.strip())
-        if rows:
-            c.executemany(
-                "INSERT INTO TempDraft (username, customer_id, customer_type, num, amt_teng, type, payout_rate, "
-                "discount, net, status, lotto_name, draw_date) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print("add_draft error:", e)
-        return back_to_buy(user, draw, customer_info, msg="บันทึกไม่สำเร็จ กรุณาลองใหม่")
-    finally:
-        conn.close()
-    warn = []
-    if rejected:
-        warn.append("เลขปิดรับ ไม่ได้บันทึก: " + ", ".join(rejected[:30]))
-    if invalid:
-        warn.append("ข้อมูลไม่ถูกต้อง: " + ", ".join(invalid[:30]))
-    return back_to_buy(user, draw, customer_info, msg=" | ".join(warn) or (f"เพิ่ม {len(rows)} รายการ" if rows else "ไม่มีรายการที่บันทึกได้"))
+                    num_str, amt_str = block.split('=')[0].strip(), block.split('=')[1].strip()
+                    if num_str: hold_nums.append(num_str)
+                    top, bot = (float(amt_str.split('*')[0] or 0), float(amt_str.split('*')[1] or 0)) if '*' in amt_str else (float(amt_str or 0), 0.0)
+                    for n in hold_nums: process_number(n, top, bot)
+                    hold_nums = []
+                else: hold_nums.append(block.strip())
+        if insert_data: c.executemany("INSERT INTO TempDraft (username, customer_id, customer_type, num, amt_teng, type, payout_rate, discount, net, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", insert_data)
+        conn.commit(); conn.close()
+    except: pass
+    return RedirectResponse(url=f"/buy?user={user}&draw={draw}&selected={customer_info}", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.get("/delete-draft-item")
 def delete_draft_item(id: int, user: str, draw: str, selected: str):
     try:
         conn = connect_db(); c = conn.cursor()
-        c.execute("DELETE FROM TempDraft WHERE id = %s AND username = %s", (id, user))
+        c.execute("DELETE FROM TempDraft WHERE id = %s", (id,))
         conn.commit(); conn.close()
-    except Exception as e:
-        return route_error(e)
-    return back_to_buy(user, draw, selected)
+    except: pass
+    return RedirectResponse(url=f"/buy?user={user}&draw={draw}&selected={selected}", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.get("/edit-draft-item", response_class=HTMLResponse)
 def edit_draft_item_page(id: int, user: str, draw: str, selected: str):
-    back = "/buy?" + urlencode({"user": user, "draw": draw, "selected": selected})
     try:
         conn = connect_db(); c = conn.cursor()
-        c.execute("SELECT id, num, amt_teng, type FROM TempDraft WHERE id=%s AND username=%s", (id, user))
+        c.execute("SELECT id, num, amt_teng, type FROM TempDraft WHERE id=%s", (id,))
         item = c.fetchone(); conn.close()
-        if not item:
-            return RedirectResponse(url=back, status_code=status.HTTP_303_SEE_OTHER)
-        e = lambda v: html.escape(str(v), quote=True)
-        form_html = f"""<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>แก้ไขรายการร่าง</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light"><div class="container my-4" style="max-width: 500px;"><div class="card shadow p-4 border border-warning"><h4 class="text-warning mb-3 fw-bold">✏️ แก้ไขรายการร่าง</h4><form method="POST" action="/update-draft-item"><input type="hidden" name="id" value="{int(item[0])}"><input type="hidden" name="user" value="{e(user)}"><input type="hidden" name="draw" value="{e(draw)}"><input type="hidden" name="selected" value="{e(selected)}"><div class="mb-3"><label class="form-label fw-bold">หมายเลข:</label><input type="text" name="num" class="form-control" value="{e(item[1])}" required></div><div class="mb-3"><label class="form-label fw-bold">จำนวนเงิน:</label><input type="number" step="any" name="amount" class="form-control" value="{e(item[2])}" required></div><div class="mb-3"><label class="form-label fw-bold">ประเภท:</label><input type="text" class="form-control" value="{e(item[3])}" readonly></div><button type="submit" class="btn btn-warning w-100 fw-bold py-2 mb-2">💾 บันทึก</button><a href="{e(back)}" class="btn btn-outline-secondary w-100 fw-bold">ยกเลิก</a></form></div></div></body></html>"""
+        if not item: return RedirectResponse(url=f"/buy?user={user}&draw={draw}&selected={selected}", status_code=status.HTTP_303_SEE_OTHER)
+        form_html = f"""<div class="container my-4" style="max-width: 500px;"><div class="card shadow p-4 border border-warning"><h4 class="text-warning mb-3 fw-bold">✏️ แก้ไขรายการร่าง</h4><form method="POST" action="/update-draft-item"><input type="hidden" name="id" value="{id}"><input type="hidden" name="user" value="{user}"><input type="hidden" name="draw" value="{draw}"><input type="hidden" name="selected" value="{selected}"><div class="mb-3"><label class="form-label fw-bold">หมายเลข:</label><input type="text" name="num" class="form-control" value="{item[1]}" required></div><div class="mb-3"><label class="form-label fw-bold">จำนวนเงิน:</label><input type="number" step="any" name="amount" class="form-control" value="{item[2]}" required></div><div class="mb-3"><label class="form-label fw-bold">ประเภท:</label><input type="text" class="form-control" value="{item[3]}" readonly></div><button type="submit" class="btn btn-warning w-100 fw-bold py-2 mb-2">💾 บันทึก</button><a href="/buy?user={user}&draw={draw}&selected={selected}" class="btn btn-outline-secondary w-100 fw-bold">ยกเลิก</a></form></div></div>"""
         return HTMLResponse(form_html)
-    except Exception:
-        return RedirectResponse(url=back, status_code=status.HTTP_303_SEE_OTHER)
+    except: return RedirectResponse(url=f"/buy?user={user}&draw={draw}&selected={selected}", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/update-draft-item")
-def update_draft_item(id: int = Form(...), user: str = Form(...), draw: str = Form(...), selected: str = Form(...),
-                      num: str = Form(...), amount: float = Form(...)):
-    num = num.strip()
-    conn = connect_db()
+def update_draft_item(id: int = Form(...), user: str = Form(...), draw: str = Form(...), selected: str = Form(...), num: str = Form(...), amount: float = Form(...)):
+    parts = selected.split('|'); c_id, c_type = parts[0], parts[2]
     try:
-        c = conn.cursor()
-        # อ่านข้อมูลจากแถวโพยร่างเอง (ไม่เชื่อค่า selected จากฟอร์ม)
-        c.execute("SELECT type, customer_id, customer_type, lotto_name, draw_date FROM TempDraft WHERE id=%s AND username=%s", (id, user))
-        row = c.fetchone()
-        if not row:
-            return back_to_buy(user, draw, selected, msg="ไม่พบรายการ")
-        t_type, cid, ctype, lotto_name, draw_clean = row
-        if lotto_name is None or draw_clean is None:
-            lotto_name, draw_clean = split_draw(draw)
-        need_len = 3 if "3ตัว" in t_type else (2 if "2ตัว" in t_type else 1)
-        if not re.fullmatch(r"[0-9]{1,3}", num) or len(num) != need_len or not (0 < amount <= 1_000_000):
-            return back_to_buy(user, draw, selected, msg=f"เลขต้องเป็นตัวเลข {need_len} หลัก และยอดเงิน 1-1,000,000")
-        rates, _src = common.get_rates(c, common.target_key(ctype, int(cid)), lotto_name)
-        if not rates:
-            return back_to_buy(user, draw, selected, msg="ไม่พบเรตของผู้ซื้อรายนี้")
-        kind = "3d" if "3ตัว" in t_type else ("2d" if "2ตัว" in t_type else "run")
-        d = round(amount * common.disc_pct(rates, kind) / 100.0, 2)
-        st = common.get_blocked_map(c, lotto_name, draw_clean).get(num, "ปกติ")
-        if st == "ปิดรับ":
-            return back_to_buy(user, draw, selected, msg=f"เลข {num} ปิดรับ")
-        c.execute("UPDATE TempDraft SET num=%s, amt_teng=%s, discount=%s, net=%s, status=%s WHERE id=%s AND username=%s",
-                  (num, amount, d, round(amount - d, 2), st, id, user))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        return route_error(e)
-    finally:
-        conn.close()
-    return back_to_buy(user, draw, selected)
+        conn = connect_db(); c = conn.cursor()
+        table = "Customers" if c_type == 'Customer' else "Users"
+        c.execute(f"SELECT disc_total, disc_3d, disc_2d, disc_run FROM {table} WHERE id=%s", (c_id,))
+        res = c.fetchone()
+        disc_total, disc_3d, disc_2d, disc_run = float(res[0] or 0), float(res[1] or 0), float(res[2] or 0), float(res[3] or 0)
+        c.execute("SELECT type FROM TempDraft WHERE id=%s", (id,))
+        t_type = c.fetchone()[0]
+        d_rate = disc_3d if "3ตัว" in t_type and disc_3d > 0 else (disc_2d if "2ตัว" in t_type and disc_2d > 0 else (disc_run if "วิ่ง" in t_type and disc_run > 0 else disc_total))
+        final_disc = amount * (d_rate / 100.0)
+        c.execute("UPDATE TempDraft SET num=%s, amt_teng=%s, discount=%s, net=%s, status=%s WHERE id=%s", (num.strip(), amount, final_disc, amount - final_disc, check_number_blocked_status(draw, num.strip()), id))
+        conn.commit(); conn.close()
+    except: pass
+    return RedirectResponse(url=f"/buy?user={user}&draw={draw}&selected={selected}", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.get("/clear-draft")
 def clear_draft(user: str, draw: str, selected: str):
-    sel = parse_selected(selected)
-    lotto_name, draw_clean = split_draw(draw)
-    if sel:
-        try:
-            conn = connect_db(); c = conn.cursor()
-            c.execute("DELETE FROM TempDraft WHERE username=%s AND customer_id=%s AND customer_type=%s "
-                      "AND lotto_name=%s AND draw_date=%s", (user, sel[0], sel[2], lotto_name, draw_clean))
-            conn.commit(); conn.close()
-        except Exception as e:
-            return route_error(e)
-    return back_to_buy(user, draw, selected)
+    parts = selected.split('|')
+    try:
+        conn = connect_db(); c = conn.cursor()
+        c.execute("DELETE FROM TempDraft WHERE username=%s AND customer_id=%s AND customer_type=%s", (user, parts[0], parts[2]))
+        conn.commit(); conn.close()
+    except: pass
+    return RedirectResponse(url=f"/buy?user={user}&draw={draw}&selected={selected}", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/confirm-bill", response_class=HTMLResponse)
 def confirm_bill(user: str = Form(...), draw: str = Form(...), customer_info: str = Form(...), lotto_name: str = Form(...)):
-    sel = parse_selected(customer_info)
-    if not sel:
-        return back_to_buy(user, draw, "", msg="ไม่ได้เลือกลูกค้า / สายงาน")
-    c_id, _name, c_type = sel
-    _ln, draw_clean = split_draw(draw)
-    lotto_name = _ln or lotto_name.strip()
-    conn = connect_db()
+    parts = customer_info.split('|'); c_id, c_name, c_type = parts[0], parts[1], parts[2]
+    draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
     try:
-        c = conn.cursor()
-        role = (common.get_user(c, user) or {}).get("role", "Member")
-        if not can_use_target(c, user, role, c_id, c_type):
-            return back_to_buy(user, draw, customer_info, msg="คุณไม่มีสิทธิ์ออกบิลให้ผู้ซื้อรายนี้")
-        c_name = common.get_target_name(c, c_type, int(c_id)) or ""
+        bill_no = generate_bill_no(lotto_name, draw_clean, c_id)
+        conn = connect_db(); c = conn.cursor()
+        table = "Customers" if c_type == 'Customer' else "Users"
+        c.execute(f"SELECT disc_total, disc_3d, disc_2d, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot FROM {table} WHERE id=%s", (c_id,))
+        c_res = c.fetchone()
+        disc_total, disc_3d, disc_2d, disc_run = float(c_res[0] or 0), float(c_res[1] or 0), float(c_res[2] or 0), float(c_res[3] or 0)
+        pay_3d_def, pay_3tod_def, pay_2d_def = float(c_res[4] or 500), float(c_res[5] or 100), float(c_res[6] or 70)
+        pay_run_top_def, pay_run_bot_def = float(c_res[7] or 3), float(c_res[8] or 4)
 
-        # 1) ตรวจงวด / เวลาปิดรับ ฝั่งเซิร์ฟเวอร์
-        c.execute("SELECT status, close_time FROM LotteryCampaigns WHERE lotto_name=%s AND (draw_date=%s OR draw_date ILIKE %s) "
-                  "ORDER BY id DESC LIMIT 1", (lotto_name, draw_clean, f"%{common.like_escape(draw_clean)}%"))
-        camp = c.fetchone()
-        if camp:
-            ok, reason = common.campaign_open({"status": camp[0], "close_time": camp[1]})
-            if not ok:
-                return back_to_buy(user, draw, customer_info, msg=reason + " ไม่สามารถออกบิลได้")
-
-        # 2) ดึงโพยร่าง (ล็อกแถวกันกดซ้ำ) — ใช้เรต/ส่วนลดที่คำนวณไว้ตอนเพิ่มโพย (รวมเรตแยกหวย)
-        c.execute("SELECT id, num, type, amt_teng, payout_rate, discount, net FROM TempDraft "
-                  "WHERE username=%s AND customer_id=%s AND customer_type=%s AND lotto_name=%s AND draw_date=%s "
-                  "ORDER BY id FOR UPDATE", (user, c_id, c_type, lotto_name, draw_clean))
+        c.execute("SELECT num, type, amt_teng, status FROM TempDraft WHERE username=%s AND customer_id=%s AND customer_type=%s", (user, c_id, c_type))
         drafts = c.fetchall()
-        if not drafts:
-            return back_to_buy(user, draw, customer_info, msg="ไม่มีรายการในโพยร่าง")
-
-        # 3) เช็คเลขอั้นซ้ำอีกครั้ง
-        blocked = common.get_blocked_map(c, lotto_name, draw_clean)
-        closed_now = sorted({d[1] for d in drafts if blocked.get(d[1]) == "ปิดรับ"})
-        if closed_now:
-            return back_to_buy(user, draw, customer_info, msg="มีเลขที่เพิ่งปิดรับ กรุณาลบก่อน: " + ", ".join(closed_now))
-
-        bill_no = common.generate_bill_no(c, lotto_name, draw_clean, c_type, int(c_id))
+        bill_items, total_amt, total_disc, total_net = [], 0.0, 0.0, 0.0
         ts = get_thai_time().strftime("%d/%m/%Y %H:%M:%S")
-        bill_items, tx_rows = [], []
-        total_amt = total_disc = total_net = 0.0
-        for did, n, t_type, amt, rate, disc, net in drafts:
-            amt, disc, net = float(amt or 0), float(disc or 0), float(net or 0)
-            tx_rows.append((draw_clean, ts, user, int(c_id), c_name, c_type, bill_no, n, t_type, amt,
-                            blocked.get(n, "ปกติ"), disc, net, float(rate or 0), lotto_name))
-            bill_items.append({"num": n, "type": t_type, "amount": amt})
-            total_amt += amt; total_disc += disc; total_net += net
-        c.executemany("INSERT INTO Transactions (draw_date, timestamp, username, customer_id, customer_name, customer_type, "
-                      "bill_no, num, type, amount, status, discount, net, payout_rate, lotto_name) "
-                      "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", tx_rows)
-        c.execute("DELETE FROM TempDraft WHERE id = ANY(%s)", ([d[0] for d in drafts],))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        return route_error(e)
-    finally:
+        
+        if drafts:
+            insert_transactions = []
+            for n, t_type, amt, status_val in drafts:
+                amt_val = float(amt or 0)
+                final_rate = pay_3d_def if t_type == "3ตัวตรง" else (pay_3tod_def if t_type == "3ตัวโต๊ด" else (pay_2d_def if "2ตัว" in t_type else (pay_run_top_def if t_type == "วิ่งบน" else pay_run_bot_def)))
+                d_rate = disc_3d if "3ตัว" in t_type and disc_3d > 0 else (disc_2d if "2ตัว" in t_type and disc_2d > 0 else (disc_run if "วิ่ง" in t_type and disc_run > 0 else disc_total))
+                final_disc = amt_val * (d_rate / 100.0)
+                final_net = amt_val - final_disc
+                insert_transactions.append((draw_clean, ts, user, int(c_id), c_name, c_type, bill_no, n, t_type, amt_val, status_val, final_disc, final_net, final_rate, lotto_name))
+                bill_items.append({"num": n, "type": t_type, "amount": amt_val})
+                total_amt += amt_val; total_disc += final_disc; total_net += final_net
+            c.executemany("INSERT INTO Transactions (draw_date, timestamp, username, customer_id, customer_name, customer_type, bill_no, num, type, amount, status, discount, net, payout_rate, lotto_name) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", insert_transactions)
+            c.execute("DELETE FROM TempDraft WHERE username=%s AND customer_id=%s AND customer_type=%s", (user, c_id, c_type))
+            conn.commit()
         conn.close()
-    content = Template(BILL_PRINT_TEMPLATE).render(
-        lotto_title=lotto_name, draw_date=draw_clean, draw_date_raw=draw, bill_no=bill_no, timestamp=ts,
-        customer_name=c_name, username=user, bill_items=bill_items, total_amt=total_amt,
-        total_disc=total_disc, total_net=total_net, selected_target_raw=customer_info)
-    return HTMLResponse(content)
+        content = Template(BILL_PRINT_TEMPLATE).render(lotto_title=lotto_name, draw_date=draw_clean, draw_date_raw=draw, bill_no=bill_no, timestamp=ts, customer_name=c_name, username=user, bill_items=bill_items, total_amt=total_amt, total_disc=total_disc, total_net=total_net, selected_target_raw=customer_info)
+        return HTMLResponse(content)
+    except: pass
 
 # ================= Routes ระบบรายงาน & แดชบอร์ด & การตั้งค่า (ที่เคยหายไป) =================
 
@@ -1883,7 +1757,7 @@ def results_page(user: str, draw: str, msg: str = None):
         conn = connect_db(); c = conn.cursor()
         c.execute("SELECT role FROM Users WHERE username=%s", (user,))
         role = c.fetchone()[0]
-        if role != 'Admin': return RedirectResponse(url=f"/buy?user={_q(user)}&draw={_q(draw)}", status_code=status.HTTP_303_SEE_OTHER)
+        if role != 'Admin': return RedirectResponse(url=f"/buy?user={user}&draw={draw}", status_code=status.HTTP_303_SEE_OTHER)
         draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
         
         c.execute("SELECT prize_1, bottom_2 FROM DrawResults WHERE draw_date = %s OR draw_date ILIKE %s", (draw_clean, f"%{draw_clean}%"))
@@ -1922,7 +1796,7 @@ def results_page(user: str, draw: str, msg: str = None):
         close_t = get_current_campaign_close_time(draw_clean)
         content = Template(RESULTS_CONTENT).render(username=user, draw_date=draw, prize_1=prize_1, bottom_2=bottom_2, total_sales=total_sales, total_net=total_net, winners=winners, total_payout=total_payout)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, current_close_time=close_t, msg=msg)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.post("/save-results")
 def save_results(user: str = Form(...), draw: str = Form(...), prize_1: str = Form(...), bottom_2: str = Form(...)):
@@ -1932,8 +1806,8 @@ def save_results(user: str = Form(...), draw: str = Form(...), prize_1: str = Fo
         c.execute("INSERT INTO DrawResults (draw_date, prize_1, bottom_2) VALUES (%s, %s, %s) ON CONFLICT (draw_date) DO UPDATE SET prize_1=EXCLUDED.prize_1, bottom_2=EXCLUDED.bottom_2", (draw_clean, prize_1.strip(), bottom_2.strip()))
         c.execute("UPDATE LotteryCampaigns SET result_timestamp = %s WHERE draw_date = %s OR draw_date ILIKE %s", (get_thai_time().strftime("%Y-%m-%d %H:%M:%S"), draw_clean, f"%{draw_clean}%"))
         conn.commit(); conn.close()
-    except Exception as e: return route_error(e)
-    return RedirectResponse(url=f"/results?user={_q(user)}&draw={_q(draw)}&msg=บันทึกผลรางวัลสำเร็จ เริ่มนับถอยหลังปิดงวดอัตโนมัติ 2 วัน", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
+    return RedirectResponse(url=f"/results?user={user}&draw={draw}&msg=บันทึกผลรางวัลสำเร็จ เริ่มนับถอยหลังปิดงวดอัตโนมัติ 2 วัน", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.get("/reports", response_class=HTMLResponse)
 def reports_page(user: str, draw: str):
@@ -1943,7 +1817,7 @@ def reports_page(user: str, draw: str):
         role = c.fetchone()[0]
         
         if role == 'Admin': c.execute("SELECT username, lotto_name, draw_date, SUM(amount), SUM(net) FROM Transactions GROUP BY username, lotto_name, draw_date")
-        else: c.execute("SELECT username, lotto_name, draw_date, SUM(amount), SUM(net) FROM Transactions WHERE username = ANY(%s) GROUP BY username, lotto_name, draw_date", (common.get_subtree(c, user),))
+        else: c.execute("SELECT username, lotto_name, draw_date, SUM(amount), SUM(net) FROM Transactions WHERE username=%s GROUP BY username, lotto_name, draw_date", (user,))
         
         report_data, total_sys_sales, total_sys_net = {}, 0.0, 0.0
         for row in c.fetchall():
@@ -1962,7 +1836,7 @@ def reports_page(user: str, draw: str):
         close_t = get_current_campaign_close_time(draw_clean)
         content = Template(REPORTS_CONTENT).render(rep_total_sales=total_sys_sales, rep_total_net=total_sys_net, report_data=report_data)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page(user: str, draw: str, start_date: str = None, end_date: str = None):
@@ -1976,7 +1850,7 @@ def dashboard_page(user: str, draw: str, start_date: str = None, end_date: str =
         if role == 'Admin':
             c.execute("SELECT username, COALESCE(lotto_name, 'ไม่ระบุประเภท'), timestamp, amount, net FROM Transactions WHERE timestamp IS NOT NULL")
         else:
-            c.execute("SELECT username, COALESCE(lotto_name, 'ไม่ระบุประเภท'), timestamp, amount, net FROM Transactions WHERE timestamp IS NOT NULL AND username = ANY(%s)", (common.get_subtree(c, user),))
+            c.execute("SELECT username, COALESCE(lotto_name, 'ไม่ระบุประเภท'), timestamp, amount, net FROM Transactions WHERE timestamp IS NOT NULL AND username = %s", (user,))
         
         rows = c.fetchall()
         conn.close()
@@ -2050,14 +1924,14 @@ def audit_all_page(user: str, draw: str):
         conn = connect_db(); c = conn.cursor()
         c.execute("SELECT role FROM Users WHERE username=%s", (user,))
         role = c.fetchone()[0]
-        if role != 'Admin': return RedirectResponse(url=f"/buy?user={_q(user)}&draw={_q(draw)}", status_code=status.HTTP_303_SEE_OTHER)
+        if role != 'Admin': return RedirectResponse(url=f"/buy?user={user}&draw={draw}", status_code=status.HTTP_303_SEE_OTHER)
         draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
         c.execute("SELECT * FROM Transactions WHERE (draw_date = %s OR draw_date ILIKE %s) ORDER BY id DESC", (draw_clean, f"%{draw_clean}%"))
         audit_rows = c.fetchall(); conn.close()
         close_t = get_current_campaign_close_time(draw_clean)
         content = Template(AUDIT_ALL_CONTENT).render(audit_rows=audit_rows)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.get("/audit-discount", response_class=HTMLResponse)
 def audit_discount_page(user: str, draw: str):
@@ -2067,12 +1941,12 @@ def audit_discount_page(user: str, draw: str):
         role = c.fetchone()[0]
         draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
         if role == 'Admin': c.execute("SELECT * FROM Transactions WHERE (draw_date = %s OR draw_date ILIKE %s) ORDER BY id DESC", (draw_clean, f"%{draw_clean}%"))
-        else: c.execute("SELECT * FROM Transactions WHERE ((draw_date = %s OR draw_date ILIKE %s) AND username = ANY(%s)) ORDER BY id DESC", (draw_clean, f"%{draw_clean}%", common.get_subtree(c, user)))
+        else: c.execute("SELECT * FROM Transactions WHERE ((draw_date = %s OR draw_date ILIKE %s) AND username = %s) ORDER BY id DESC", (draw_clean, f"%{draw_clean}%", user))
         discount_rows = c.fetchall(); conn.close()
         close_t = get_current_campaign_close_time(draw_clean)
         content = Template(AUDIT_DISCOUNT_CONTENT).render(discount_rows=discount_rows)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.get("/db-inspector", response_class=HTMLResponse)
 def db_inspector_page(user: str, draw: str, table_name: str = None):
@@ -2080,7 +1954,7 @@ def db_inspector_page(user: str, draw: str, table_name: str = None):
         conn = connect_db(); c = conn.cursor()
         c.execute("SELECT role FROM Users WHERE username=%s", (user,))
         role = c.fetchone()[0]
-        if role != 'Admin': return RedirectResponse(url=f"/buy?user={_q(user)}&draw={_q(draw)}", status_code=status.HTTP_303_SEE_OTHER)
+        if role != 'Admin': return RedirectResponse(url=f"/buy?user={user}&draw={draw}", status_code=status.HTTP_303_SEE_OTHER)
         c.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;")
         tables = [row[0] for row in c.fetchall()]
         rows, columns = [], []
@@ -2094,7 +1968,7 @@ def db_inspector_page(user: str, draw: str, table_name: str = None):
         close_t = get_current_campaign_close_time(draw_clean)
         content = Template(DB_INSPECTOR_TEMPLATE).render(tables=tables, selected_table=selected_table, columns=columns, rows=rows, draw_date=draw, username=user)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.get("/customers", response_class=HTMLResponse)
 def customers_page(user: str, draw: str, msg: str = None, error: str = None, edit_id: int = None):
@@ -2109,61 +1983,32 @@ def customers_page(user: str, draw: str, msg: str = None, error: str = None, edi
             custs_list = c.fetchall()
         edit_customer = None
         if edit_id:
-            c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run FROM Customers WHERE id=%s AND (LOWER(owner_username)=LOWER(%s) OR %s)", (edit_id, user, role == "Admin"))
+            c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run FROM Customers WHERE id=%s", (edit_id,))
             edit_customer = c.fetchone()
         conn.close()
         draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
         close_t = get_current_campaign_close_time(draw_clean)
         content = Template(CUSTOMER_CONTENT).render(username=user, draw_date=draw, customers_list=custs_list, edit_customer=edit_customer)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, msg=msg, error=error, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.post("/save-customer")
-def save_customer(user: str = Form(...), draw: str = Form(...), name: str = Form(...), disc_total: float = Form(0),
-                  disc_run: float = Form(0), pay_3d: float = Form(500), pay_3tod: float = Form(100), pay_2d: float = Form(70),
-                  pay_run_top: float = Form(3), pay_run_bot: float = Form(4)):
-    name = name.strip()[:100]
-    v = common.clean_rates(dict(disc_total=disc_total, disc_run=disc_run, pay_3d=pay_3d, pay_3tod=pay_3tod,
-                                pay_2d=pay_2d, pay_run_top=pay_run_top, pay_run_bot=pay_run_bot))
-    if not name:
-        return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "error": "กรุณาระบุชื่อลูกค้า"}), status_code=303)
+def save_customer(user: str = Form(...), draw: str = Form(...), name: str = Form(...), disc_total: float = Form(0), disc_run: float = Form(0), pay_3d: float = Form(0), pay_3tod: float = Form(0), pay_2d: float = Form(0), pay_run_top: float = Form(3), pay_run_bot: float = Form(4)):
     try:
         conn = connect_db(); c = conn.cursor()
-        c.execute("INSERT INTO Customers (name, owner_username, discount_type, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot) "
-                  "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                  (name, user, 1, v["disc_total"], v["disc_run"], v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"]))
+        c.execute("INSERT INTO Customers (name, owner_username, discount_type, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (name, user, 1, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot))
         conn.commit(); conn.close()
-        return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "msg": "เพิ่มลูกค้าสำเร็จ"}), status_code=303)
-    except Exception as e:
-        return route_error(e)
+        return RedirectResponse(url=f"/customers?user={user}&draw={draw}&msg=เพิ่มลูกค้าสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
 
 @app.post("/update-customer")
-def update_customer(user: str = Form(...), draw: str = Form(...), customer_id: int = Form(...), name: str = Form(...),
-                    disc_total: float = Form(0), disc_run: float = Form(0), pay_3d: float = Form(500),
-                    pay_3tod: float = Form(100), pay_2d: float = Form(70), pay_run_top: float = Form(3), pay_run_bot: float = Form(4)):
-    name = name.strip()[:100]
-    v = common.clean_rates(dict(disc_total=disc_total, disc_run=disc_run, pay_3d=pay_3d, pay_3tod=pay_3tod,
-                                pay_2d=pay_2d, pay_run_top=pay_run_top, pay_run_bot=pay_run_bot))
-    conn = connect_db()
+def update_customer(user: str = Form(...), draw: str = Form(...), customer_id: int = Form(...), name: str = Form(...), disc_total: float = Form(0), disc_run: float = Form(0), pay_3d: float = Form(0), pay_3tod: float = Form(0), pay_2d: float = Form(0), pay_run_top: float = Form(3), pay_run_bot: float = Form(4)):
     try:
-        c = conn.cursor()
-        role = (common.get_user(c, user) or {}).get("role", "Member")
-        if not name:
-            return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "error": "กรุณาระบุชื่อลูกค้า"}), status_code=303)
-        c.execute("UPDATE Customers SET name=%s, disc_total=%s, disc_run=%s, pay_3d=%s, pay_3tod=%s, pay_2d=%s, pay_run_top=%s, pay_run_bot=%s "
-                  "WHERE id=%s AND (LOWER(owner_username)=LOWER(%s) OR %s)",
-                  (name, v["disc_total"], v["disc_run"], v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"],
-                   customer_id, user, role == "Admin"))
-        if c.rowcount == 0:
-            conn.rollback()
-            return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "error": "ไม่พบลูกค้า หรือคุณไม่มีสิทธิ์แก้ไขรายนี้"}), status_code=303)
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        return route_error(e)
-    finally:
-        conn.close()
-    return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "msg": "แก้ไขสำเร็จ"}), status_code=303)
+        conn = connect_db(); c = conn.cursor()
+        c.execute("UPDATE Customers SET name=%s, disc_total=%s, disc_run=%s, pay_3d=%s, pay_3tod=%s, pay_2d=%s, pay_run_top=%s, pay_run_bot=%s WHERE id=%s", (name, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, customer_id))
+        conn.commit(); conn.close()
+        return RedirectResponse(url=f"/customers?user={user}&draw={draw}&msg=แก้ไขสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
 
 @app.get("/users", response_class=HTMLResponse)
 def users_page(user: str, draw: str, msg: str = None, error: str = None):
@@ -2177,42 +2022,70 @@ def users_page(user: str, draw: str, msg: str = None, error: str = None):
         close_t = get_current_campaign_close_time(draw_clean)
         content = Template(USERS_CONTENT).render(username=user, role=role, draw_date=draw, users_list=users_list)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, msg=msg, error=error, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.post("/save-user-level")
-def save_user_level(user: str = Form(...), draw: str = Form(...), new_username: str = Form(...), new_password: str = Form(...),
-                    new_role: str = Form(...), disc_total: float = Form(0), disc_run: float = Form(0), pay_3d: float = Form(500),
-                    pay_3tod: float = Form(100), pay_2d: float = Form(70), pay_run_top: float = Form(3), pay_run_bot: float = Form(4)):
-    def back(**kw):
-        return RedirectResponse(url="/users?" + urlencode({"user": user, "draw": draw, **kw}), status_code=303)
-    new_username = new_username.strip()
-    v = common.clean_rates(dict(disc_total=disc_total, disc_run=disc_run, pay_3d=pay_3d, pay_3tod=pay_3tod,
-                                pay_2d=pay_2d, pay_run_top=pay_run_top, pay_run_bot=pay_run_bot))
-    conn = connect_db()
+def save_user_level(user: str = Form(...), draw: str = Form(...), new_username: str = Form(...), new_password: str = Form(...), new_role: str = Form(...), disc_total: float = Form(0), disc_run: float = Form(0), pay_3d: float = Form(0), pay_3tod: float = Form(0), pay_2d: float = Form(0), pay_run_top: float = Form(3), pay_run_bot: float = Form(4)):
     try:
+        conn = connect_db(); c = conn.cursor()
+        c.execute("INSERT INTO Users (username, password, role, parent_user, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", (new_username, new_password, new_role, user, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot))
+        conn.commit(); conn.close()
+        return RedirectResponse(url=f"/users?user={user}&draw={draw}&msg=สร้างสมาชิกใหม่สำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
+
+@app.get("/system-reset", response_class=HTMLResponse)
+def system_reset_page(user: str, error: str = None):
+    try:
+        conn = connect_db()
         c = conn.cursor()
-        me = common.get_user(c, user)
-        # กันการยกระดับสิทธิ์: สร้างได้เฉพาะระดับที่ต่ำกว่าตัวเอง
-        if not me or new_role not in common.CREATABLE_ROLES.get(me["role"], []):
-            return back(error="คุณไม่มีสิทธิ์สร้างผู้ใช้ระดับนี้")
-        if not re.fullmatch(r"[A-Za-z0-9_.\-]{3,50}", new_username):
-            return back(error="Username ใช้ได้เฉพาะ a-z A-Z 0-9 _ . - ความยาว 3-50 ตัว")
-        if len(new_password) < 6:
-            return back(error="รหัสผ่านต้องมีอย่างน้อย 6 ตัว")
-        c.execute("SELECT 1 FROM Users WHERE LOWER(username)=LOWER(%s)", (new_username,))
-        if c.fetchone():
-            return back(error="มี Username นี้อยู่แล้ว")
-        c.execute("INSERT INTO Users (username, password, role, parent_user, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot) "
-                  "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                  (new_username, common.store_password(new_password), new_role, user, v["disc_total"], v["disc_run"],
-                   v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"]))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        return route_error(e)
-    finally:
+        # ตรวจสอบสิทธิ์ว่าเป็น Admin จริงหรือไม่
+        c.execute("SELECT role FROM Users WHERE username=%s", (user,))
+        res = c.fetchone()
         conn.close()
-    return back(msg="สร้างสมาชิกใหม่สำเร็จ")
+        
+        role = res[0] if res else ""
+        if role != 'Admin':
+            return RedirectResponse(url=f"/select-market?user={user}", status_code=303)
+    except:
+        return RedirectResponse(url=f"/select-market?user={user}", status_code=303)
+
+    return Template(SYSTEM_RESET_TEMPLATE).render(username=user, error=error)
+
+@app.post("/execute-system-reset")
+def execute_system_reset(username: str = Form(...), admin_password: str = Form(...)):
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        
+        # 1. ตรวจสอบรหัสผ่านของ Admin เพื่อความปลอดภัยสูงสุด
+        c.execute("SELECT id FROM Users WHERE username=%s AND password=%s AND role='Admin'", (username, admin_password))
+        admin_check = c.fetchone()
+        
+        if not admin_check:
+            conn.close()
+            return RedirectResponse(url=f"/system-reset?user={username}&error=รหัสผ่าน Admin ไม่ถูกต้อง ไม่สามารถรีเซ็ตระบบได้!", status_code=303)
+
+        # 2. ทำการเคลียร์ข้อมูลในตารางต่างๆ ออกทั้งหมดอย่างหมดจด
+        c.execute("DELETE FROM Transactions;")
+        c.execute("DELETE FROM TempDraft;")
+        c.execute("DELETE FROM BlockedNumbers;")
+        c.execute("DELETE FROM CustomerLottoRates;")
+        c.execute("DELETE FROM AgentSettlements;")
+        c.execute("DELETE FROM DrawResults;")
+        c.execute("DELETE FROM Customers;")
+        c.execute("DELETE FROM LotteryCampaigns;")
+        
+        # 3. ลบ Users ทั้งหมด ยกเว้นบัญชี Admin ปัจจุบันของคุณบุญชัย
+        c.execute("DELETE FROM Users WHERE username != %s;", (username,))
+        
+        conn.commit()
+        conn.close()
+        
+        # รีเซ็ตสำเร็จ เด้งกลับไปหน้า Login พร้อมข้อความแจ้งเตือน
+        return RedirectResponse(url="/login?error=รีเซ็ตระบบสำเร็จ! ข้อมูลถูกล้างเกลี้ยงพร้อมเริ่มใช้งานจริงแล้ว กรุณาเข้าสู่ระบบใหม่อีกครั้ง", status_code=303)
+        
+    except Exception as e:
+        return RedirectResponse(url=f"/system-reset?user={username}&error=เกิดข้อผิดพลาดในการรีเซ็ต: {str(e)}", status_code=303)
 
 @app.get("/password", response_class=HTMLResponse)
 def password_page(user: str, draw: str, msg: str = None, error: str = None):
@@ -2224,31 +2097,19 @@ def password_page(user: str, draw: str, msg: str = None, error: str = None):
         close_t = get_current_campaign_close_time(draw_clean)
         content = Template(PASSWORD_TEMPLATE).render(username=user, draw_date=draw)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, msg=msg, error=error, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+    except: pass
 
 @app.post("/update-password")
 def update_password(user: str = Form(...), draw: str = Form(...), old_password: str = Form(...), new_password: str = Form(...), confirm_password: str = Form(...)):
-    def back(**kw):
-        return RedirectResponse(url="/password?" + urlencode({"user": user, "draw": draw, **kw}), status_code=303)
-    if new_password != confirm_password:
-        return back(error="รหัสผ่านไม่ตรงกัน!")
-    if len(new_password) < 6:
-        return back(error="รหัสผ่านต้องมีอย่างน้อย 6 ตัว")
-    conn = connect_db()
+    if new_password != confirm_password: return RedirectResponse(url=f"/password?user={user}&draw={draw}&error=รหัสผ่านไม่ตรงกัน!", status_code=status.HTTP_303_SEE_OTHER)
     try:
-        c = conn.cursor()
-        c.execute("SELECT password FROM Users WHERE username=%s", (user,))
-        row = c.fetchone()
-        if not row or not common.verify_password(row[0], old_password):
-            return back(error="รหัสผ่านเดิมไม่ถูกต้อง")
-        c.execute("UPDATE Users SET password=%s WHERE username=%s", (common.store_password(new_password), user))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        return route_error(e)
-    finally:
-        conn.close()
-    return back(msg="เปลี่ยนรหัสผ่านสำเร็จ!")
+        conn = connect_db(); c = conn.cursor()
+        c.execute("SELECT id FROM Users WHERE username=%s AND password=%s", (user, old_password))
+        if not c.fetchone(): return RedirectResponse(url=f"/password?user={user}&draw={draw}&error=รหัสผ่านเดิมไม่ถูกต้อง", status_code=status.HTTP_303_SEE_OTHER)
+        c.execute("UPDATE Users SET password=%s WHERE username=%s", (new_password, user))
+        conn.commit(); conn.close()
+        return RedirectResponse(url=f"/password?user={user}&draw={draw}&msg=เปลี่ยนรหัสผ่านสำเร็จ!", status_code=status.HTTP_303_SEE_OTHER)
+    except: pass
 
 # ================= หน้าจอจัดการเรตลูกค้าแยกตามหวย (ระบบหลัก) =================
 CUSTOMER_RATES_TEMPLATE = """
@@ -2263,7 +2124,7 @@ CUSTOMER_RATES_TEMPLATE = """
     <div class="container my-4">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <h2>⚙️ กำหนดเรตอัตราจ่าย & ส่วนลด (แยกรายลูกค้า / แยกรายหวย)</h2>
-            <a href="/campaigns?user={{ username }}" class="btn btn-secondary">กลับหน้าหลัก</a>
+            <a href="/dashboard?user={{ username }}&draw=หน้าหลักจัดการงวด" class="btn btn-secondary">กลับหน้าหลัก</a>
         </div>
 
         {% if msg %}
@@ -2312,7 +2173,6 @@ CUSTOMER_RATES_TEMPLATE = """
                 <div class="row g-3">
                     <div class="col-md-4"><label class="form-label small">ส่วนลด 3 ตัว (%):</label><input type="number" step="any" name="disc_3d" class="form-control" value="0"></div>
                     <div class="col-md-4"><label class="form-label small">ส่วนลด 2 ตัว (%):</label><input type="number" step="any" name="disc_2d" class="form-control" value="0"></div>
-                    <div class="col-md-4"><label class="form-label small">ส่วนลดวิ่ง (%):</label><input type="number" step="any" name="disc_run" class="form-control" value="0"></div>
                     <div class="col-md-4"><label class="form-label small">ส่วนลดรวมทุกประเภท (%):</label><input type="number" step="any" name="disc_total" class="form-control" value="0"></div>
                 </div>
             </form>
@@ -2324,61 +2184,65 @@ CUSTOMER_RATES_TEMPLATE = """
 
 @app.get("/customer-rates-page", response_class=HTMLResponse)
 def customer_rates_page(user: str, msg: str = None):
-    customers, lotto_list = [], []
     try:
         conn = connect_db()
         c = conn.cursor()
-        me = common.get_user(c, user)
-        if me and me["role"] == "Admin":
-            c.execute("SELECT id, name, owner_username FROM Customers ORDER BY id DESC")
-        else:
-            c.execute("SELECT id, name, owner_username FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY id DESC", (user,))
+        c.execute("SELECT id, name, owner_username FROM Customers ORDER BY id DESC")
         customers = c.fetchall()
-        c.execute("SELECT DISTINCT lotto_name FROM LotteryCampaigns WHERE lotto_name IS NOT NULL ORDER BY lotto_name")
+        c.execute("SELECT DISTINCT lotto_name FROM LotteryCampaigns WHERE lotto_name IS NOT NULL")
         lotto_list = [row[0] for row in c.fetchall()]
         conn.close()
     except Exception as e:
         print("Load Customer Rates Error:", e)
-    return Template(CUSTOMER_RATES_TEMPLATE).render(username=user, customers=customers, lotto_list=lotto_list, msg=msg)
+        customers = []
+        lotto_list = []
+    
+    return Template(CUSTOMER_RATES_TEMPLATE).render(
+        username=user, customers=customers, lotto_list=lotto_list, msg=msg
+    )
 
 @app.post("/save-customer-lotto-rate")
 def save_customer_lotto_rate(
-    username: str = Form(...), customer_id: int = Form(...), lotto_name: str = Form(...),
-    pay_3d: float = Form(500), pay_3tod: float = Form(100), pay_2d: float = Form(70),
-    pay_run_top: float = Form(3.2), pay_run_bot: float = Form(4.2),
-    disc_3d: float = Form(0), disc_2d: float = Form(0), disc_run: float = Form(0), disc_total: float = Form(0)
+    username: str = Form(...), 
+    customer_id: int = Form(...), 
+    lotto_name: str = Form(...),
+    pay_3d: float = Form(500), 
+    pay_3tod: float = Form(100), 
+    pay_2d: float = Form(70), 
+    pay_run_top: float = Form(3.2),
+    pay_run_bot: float = Form(4.2),  # เพิ่มช่องรับค่าวิ่งล่าง
+    disc_3d: float = Form(0), 
+    disc_2d: float = Form(0), 
+    disc_total: float = Form(0)
 ):
-    v = common.clean_rates(dict(pay_3d=pay_3d, pay_3tod=pay_3tod, pay_2d=pay_2d, pay_run_top=pay_run_top,
-                                pay_run_bot=pay_run_bot, disc_3d=disc_3d, disc_2d=disc_2d,
-                                disc_run=disc_run, disc_total=disc_total))
-    key = str(customer_id)
-    cols = ", ".join(common.RATE_KEYS)
-    conn = connect_db()
     try:
+        conn = connect_db()
         c = conn.cursor()
-        me = common.get_user(c, username)
-        c.execute("SELECT 1 FROM Customers WHERE id=%s AND (LOWER(owner_username)=LOWER(%s) OR %s)",
-                  (customer_id, username, bool(me and me["role"] == "Admin")))
-        if not c.fetchone():
-            msg = "ไม่พบลูกค้า หรือคุณไม่มีสิทธิ์ตั้งเรตให้รายนี้"
-        else:
-            c.execute("DELETE FROM CustomerLottoRates WHERE target_id=%s AND lotto_name=%s", (key, lotto_name))
-            c.execute(f"INSERT INTO CustomerLottoRates (customer_id, target_type, target_id, lotto_name, {cols}) "
-                      f"VALUES (%s,'Customer',%s,%s,{', '.join(['%s'] * len(common.RATE_KEYS))})",
-                      (customer_id, key, lotto_name, *[v[k] for k in common.RATE_KEYS]))
-            conn.commit()
-            msg = "บันทึกเรตอัตราจ่ายและส่วนลดสำเร็จ!"
-    except Exception as e:
-        conn.rollback()
-        print("save_customer_lotto_rate error:", e)
-        msg = "บันทึกไม่สำเร็จ กรุณาลองใหม่"
-    finally:
+        c.execute("""
+            INSERT INTO CustomerLottoRates (
+                customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, 
+                pay_run_top, pay_run_bot, disc_3d, disc_2d, disc_total
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (customer_id, lotto_name) 
+            DO UPDATE SET 
+                pay_3d = EXCLUDED.pay_3d, 
+                pay_3tod = EXCLUDED.pay_3tod, 
+                pay_2d = EXCLUDED.pay_2d, 
+                pay_run_top = EXCLUDED.pay_run_top, 
+                pay_run_bot = EXCLUDED.pay_run_bot, 
+                disc_3d = EXCLUDED.disc_3d, 
+                disc_2d = EXCLUDED.disc_2d, 
+                disc_total = EXCLUDED.disc_total
+        """, (customer_id, lotto_name, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_3d, disc_2d, disc_total))
+        
+        conn.commit()
         conn.close()
-    return RedirectResponse(url="/customer-rates-page?" + urlencode({"user": username, "msg": msg}), status_code=303)
-
+        msg = "บันทึกเรตอัตราจ่ายและส่วนลดสำเร็จ!"
+    except Exception as e:
+        msg = f"Error: {str(e)}"
+        
+    return RedirectResponse(url=f"/customer-rates-page?user={username}&msg={msg}", status_code=303)
 @app.get("/logout")
 def logout():
-    resp = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
-    resp.delete_cookie(common.SESSION_COOKIE)
-    return resp
-
+    return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
