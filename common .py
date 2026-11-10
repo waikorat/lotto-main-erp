@@ -28,6 +28,7 @@ import psycopg2
 # ============================================================ การเชื่อมต่อ DB
 
 DB_URI = os.environ.get("DB_URI")
+print("DEBUG DB_URI START:", DB_URI[:25] if DB_URI else "NOT FOUND") # เพิ่มบรรทัดนี้ชั่วคราว
 if not DB_URI:
     raise RuntimeError("ต้องตั้งค่า environment variable DB_URI (ห้ามฝังรหัสผ่านฐานข้อมูลไว้ในโค้ด)")
 
