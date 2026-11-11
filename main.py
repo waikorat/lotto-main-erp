@@ -128,7 +128,7 @@ class SessionAuthMiddleware:
         for part in cookie.split(";"):
             k, _, v = part.strip().partition("=")
             if k == common.SESSION_COOKIE:
-                token = v
+                token = v.strip().strip('"')
         state, me = await asyncio.get_running_loop().run_in_executor(None, _load_session_user, token)
         if state == "error":
             return await _send_text(send, 503, "ระบบฐานข้อมูลไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่อีกครั้ง")

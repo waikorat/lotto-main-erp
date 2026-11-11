@@ -28,7 +28,6 @@ import psycopg2
 # ============================================================ การเชื่อมต่อ DB
 
 DB_URI = os.environ.get("DB_URI")
-print("DEBUG DB_URI START:", DB_URI[:25] if DB_URI else "NOT FOUND") # เพิ่มบรรทัดนี้ชั่วคราว
 if not DB_URI:
     raise RuntimeError("ต้องตั้งค่า environment variable DB_URI (ห้ามฝังรหัสผ่านฐานข้อมูลไว้ในโค้ด)")
 
@@ -142,19 +141,20 @@ def _sign(data):
 
 def make_session(username):
     payload = f"{username}|{int(time.time()) + SESSION_TTL}"
-    b = base64.urlsafe_b64encode(payload.encode()).decode()
+    b = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")   # ไม่ใส่ "=" ท้ายค่า เพราะทำให้เบราว์เซอร์/เซิร์ฟเวอร์ครอบคุกกี้ด้วยเครื่องหมายคำพูด
     return f"{b}.{_sign(b)}"
 
 
 def read_session(value):
     """คืน username ถ้า cookie ถูกต้องและยังไม่หมดอายุ"""
+    value = (value or "").strip().strip('"')
     if not value or "." not in value:
         return None
     b, sig = value.rsplit(".", 1)
     if not hmac.compare_digest(sig, _sign(b)):
         return None
     try:
-        username, exp = base64.urlsafe_b64decode(b.encode()).decode().rsplit("|", 1)
+        username, exp = base64.urlsafe_b64decode((b + "=" * (-len(b) % 4)).encode()).decode().rsplit("|", 1)
         if int(exp) < time.time():
             return None
         return username
