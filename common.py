@@ -313,7 +313,7 @@ def get_campaign(c, campaign_id):
     r = c.fetchone()
     if not r:
         return None
-    return {"id": r[0], "lotto_name": r[1] or "", "draw_date": r[2] or "", "status": r[3], "close_time": r[4]}
+    return {"id": r[0], "lotto_name": clean_name(r[1]), "draw_date": clean_name(r[2]), "status": r[3], "close_time": r[4]}
 
 
 def campaign_open(camp):
@@ -370,6 +370,22 @@ def get_lotto_logo(lotto_name):
 
 # ============================================================ เลขอั้น
 
+_INVISIBLE = "[[:space:]\u00a0\u200b\u200c\u200d\ufeff]"      # รูปแบบ regex ของ Postgres
+
+
+def clean_name(x):
+    """ตัดช่องว่าง/อักขระล่องหนที่หัวท้ายชื่อ (ชื่อหวยในฐานข้อมูลเก่าอาจมีตัวแฝงทำให้เทียบกันไม่ตรง)"""
+    return re.sub(r"^[\s\u00a0\u200b-\u200d\ufeff]+|[\s\u00a0\u200b-\u200d\ufeff]+$", "", str(x or ""))
+
+
+def _name_key(x):
+    """ชื่อสำหรับเทียบ: ตัดอักขระว่าง/ล่องหนทุกตำแหน่ง"""
+    return re.sub(r"[\s\u00a0\u200b-\u200d\ufeff]+", "", str(x or ""))
+
+
+_LOTTO_COND = f"(lotto_name IS NULL OR regexp_replace(lotto_name, '{_INVISIBLE}', '', 'g') = %s)"
+
+
 def _draw_match(a, b):
     """งวดตรงกันแบบเดียวกับที่ระบบหลักใช้ (เท่ากัน หรือ มีข้อความอีกฝั่งอยู่ภายใน)"""
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
@@ -381,8 +397,8 @@ def get_blocked_map(c, lotto_name, draw_date):
     ใช้ได้กับแถวเก่าที่ยังไม่มี lotto_name (NULL = อั้นทุกตลาดในงวดนั้น)"""
     c.execute(
         "SELECT raw_num, status FROM BlockedNumbers "
-        "WHERE (draw_date=%s OR draw_date ILIKE %s) AND (lotto_name IS NULL OR lotto_name=%s)",
-        (draw_date, f"%{like_escape(draw_date)}%", lotto_name),
+        "WHERE (draw_date=%s OR draw_date ILIKE %s) AND " + _LOTTO_COND,
+        (draw_date, f"%{like_escape(draw_date)}%", _name_key(lotto_name)),
     )
     out = {}
     for num, st in c.fetchall():
@@ -398,8 +414,8 @@ def get_blocked_map(c, lotto_name, draw_date):
 def get_blocked_display(c, lotto_name, draw_date):
     """คืน (ปิดรับ, 3ตัวจ่ายครึ่ง, 2ตัวจ่ายครึ่ง) เป็นข้อความคั่นด้วยคอมม่า"""
     base = ("SELECT raw_num, status, type FROM BlockedNumbers "
-            "WHERE (draw_date=%s OR draw_date ILIKE %s) AND (lotto_name IS NULL OR lotto_name=%s)")
-    args = (draw_date, f"%{like_escape(draw_date)}%", lotto_name)
+            "WHERE (draw_date=%s OR draw_date ILIKE %s) AND " + _LOTTO_COND)
+    args = (draw_date, f"%{like_escape(draw_date)}%", _name_key(lotto_name))
     c.execute(base + " AND is_raw = TRUE", args)
     rows = c.fetchall()
     if not rows:
@@ -614,6 +630,11 @@ MIGRATIONS = [
 
     # ---- DrawResults: ระบบหลักใช้ ON CONFLICT (draw_date) จึงต้องมี unique ----
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_drawresults_date ON DrawResults(draw_date)",
+    # ---- ล้างช่องว่าง/อักขระล่องหนที่หัวท้ายชื่อหวยและวันที่งวด (ทำให้เทียบชื่อไม่ตรงข้ามระบบ) — รันซ้ำได้ ----
+    "UPDATE LotteryCampaigns SET lotto_name = regexp_replace(lotto_name, '^[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+|[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+$', '', 'g'), "
+    "draw_date = regexp_replace(draw_date, '^[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+|[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+$', '', 'g') "
+    "WHERE lotto_name ~ '^[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]|[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]$' "
+    "OR draw_date ~ '^[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]|[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]$'",
 ]
 
 

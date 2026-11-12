@@ -209,21 +209,15 @@ def back_to_buy(user, draw, selected, **kw):
 
 
 def can_use_target(c, user, role, c_id, c_type):
-    """ผู้ใช้คนนี้บันทึกโพยให้ลูกค้า/สายงานรายนี้ได้ไหม (กันแก้ค่าในฟอร์มไปใช้ของคนอื่น)"""
+    """บันทึกโพยได้เฉพาะลูกค้า/บัญชีสายงานที่ผู้ใช้คนนี้เป็นผู้สร้างเอง (ทุกบทบาท รวมแอดมิน) — ตรงกับรายชื่อในหน้าคีย์โพย"""
     try:
         cid = int(c_id)
     except (TypeError, ValueError):
         return False
     if c_type == "Customer":
-        if role == "Admin":
-            c.execute("SELECT 1 FROM Customers WHERE id=%s", (cid,))
-        else:
-            c.execute("SELECT 1 FROM Customers WHERE id=%s AND LOWER(owner_username)=LOWER(%s)", (cid, user))
+        c.execute("SELECT 1 FROM Customers WHERE id=%s AND LOWER(owner_username)=LOWER(%s)", (cid, user))
     elif c_type == "User":
-        if role == "Admin":
-            c.execute("SELECT 1 FROM Users WHERE id=%s", (cid,))
-        else:
-            c.execute("SELECT 1 FROM Users WHERE id=%s AND (LOWER(parent_user)=LOWER(%s) OR username=%s)", (cid, user, user))
+        c.execute("SELECT 1 FROM Users WHERE id=%s AND LOWER(parent_user)=LOWER(%s)", (cid, user))
     else:
         return False
     return bool(c.fetchone())
@@ -755,7 +749,7 @@ BUY_CONTENT = """
                     <label class="form-label fw-bold text-dark">เลือกลูกค้า / สายงาน:</label>
                     <select name="selected" id="customerSelect" class="form-select form-select-lg" onchange="document.getElementById('custForm').submit()">
                         {% for c in customers %}
-                            <option value="{{ c[0] }}|{{ c[1] }}|{{ c[2] }}" {% if selected_target_raw and selected_target_raw == c[0]|string ~ '|' ~ c[1] ~ '|' ~ c[2] %}selected{% endif %}>{{ c[1] }} ({{ c[2] }})</option>
+                            <option value="{{ c[0] }}|{{ c[1] }}|{{ c[2] }}" {% if selected_target_raw and selected_target_raw == c[0]|string ~ '|' ~ c[1] ~ '|' ~ c[2] %}selected{% endif %}>{{ c[1] }} ({{ 'ลูกค้า' if c[2] == 'Customer' else 'สายงาน' }})</option>
                         {% endfor %}
                     </select>
                 </div>
@@ -1459,6 +1453,7 @@ def campaigns_page(user: str, edit_id: int = None, msg: str = None, error: str =
 
 @app.post("/create-campaign")
 def create_campaign(user: str = Form(...), lotto_name: str = Form(...), draw_date: str = Form(...), close_time: str = Form(...)):
+    lotto_name, draw_date = common.clean_name(lotto_name), common.clean_name(draw_date)
     try:
         conn = connect_db()
         c = conn.cursor()
@@ -1469,6 +1464,7 @@ def create_campaign(user: str = Form(...), lotto_name: str = Form(...), draw_dat
 
 @app.post("/update-campaign")
 def update_campaign(user: str = Form(...), campaign_id: int = Form(...), lotto_name: str = Form(...), draw_date: str = Form(...), close_time: str = Form(...)):
+    lotto_name, draw_date = common.clean_name(lotto_name), common.clean_name(draw_date)
     try:
         conn = connect_db()
         c = conn.cursor()
@@ -1596,12 +1592,10 @@ def buy_page(user: str, draw: str, selected: str = None, msg: str = None):
             ln_res = c.fetchone()
             lotto_name_for_bill = ln_res[0] if ln_res else "หวยไม่ระบุ"
         
-        c.execute("SELECT id, name, 'Customer' FROM Customers WHERE owner_username=%s", (user,))
+        # ทุกบทบาท (รวมแอดมิน) เห็นเฉพาะลูกค้าและบัญชีสายงานที่ "ตัวเองเป็นผู้สร้าง" (ไม่เจาะลึกลงไปชั้นถัดไป)
+        c.execute("SELECT id, name, 'Customer' FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY name", (user,))
         custs = c.fetchall()
-        if not custs and role == 'Admin':
-            c.execute("SELECT id, name, 'Customer' FROM Customers")
-            custs = c.fetchall()
-        c.execute("SELECT id, username, 'User' FROM Users WHERE parent_user=%s", (user,))
+        c.execute("SELECT id, username, 'User' FROM Users WHERE LOWER(parent_user)=LOWER(%s) AND username <> %s ORDER BY username", (user, user))
         agents = c.fetchall()
         all_targets = custs + agents
         if not selected and all_targets: selected = f"{all_targets[0][0]}|{all_targets[0][1]}|{all_targets[0][2]}"
