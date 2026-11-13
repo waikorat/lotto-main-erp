@@ -87,13 +87,39 @@ def get_user(c, username):
     return {"id": r[0], "username": r[1], "role": norm_role(r[2]), "parent_user": r[3]}
 
 
+def _is_root_admin(c, me):
+    c.execute("SELECT id FROM Users WHERE LOWER(role)='admin' ORDER BY id LIMIT 1")
+    r = c.fetchone()
+    return bool(r) and r[0] == me["id"]
+
+
+def direct_children(c, me):
+    """ผู้ใช้ที่ me เป็น upline โดยตรง -> [(id, username, role)]
+    บัญชีเก่าที่ไม่มี upline (parent_user ว่าง และไม่ใช่แอดมิน) ถือเป็นสายตรงของแอดมินคนแรก"""
+    c.execute("SELECT id, username, role FROM Users WHERE id<>%s AND (LOWER(parent_user)=LOWER(%s) OR "
+              "(%s AND (parent_user IS NULL OR BTRIM(parent_user)='') AND LOWER(role)<>'admin')) ORDER BY id DESC",
+              (me["id"], me["username"], _is_root_admin(c, me)))
+    return c.fetchall()
+
+
+def is_direct_child(c, me, user_id):
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    return any(r[0] == user_id for r in direct_children(c, me))
+
+
 def get_subtree(c, username):
     """username ของตัวเอง + ลูกข่ายทุกชั้น (กัน loop ด้วย UNION)"""
     c.execute(
         """WITH RECURSIVE t AS (
                SELECT username FROM Users WHERE username=%s
                UNION
-               SELECT u.username FROM Users u JOIN t ON u.parent_user = t.username
+               SELECT u.username FROM Users u JOIN t ON (
+                   u.parent_user = t.username
+                   OR (t.username = (SELECT username FROM Users WHERE LOWER(role)='admin' ORDER BY id LIMIT 1)
+                       AND (u.parent_user IS NULL OR BTRIM(u.parent_user) = '') AND LOWER(u.role) <> 'admin'))
            ) SELECT username FROM t""",
         (username,),
     )
@@ -254,9 +280,7 @@ def can_set_rates_for(c, me, t_type, t_id):
     if t_type == "Customer":
         c.execute("SELECT 1 FROM Customers WHERE id=%s AND LOWER(owner_username)=LOWER(%s)", (t_id, me["username"]))
     elif t_type == "User":
-        if t_id == me["id"]:
-            return False
-        c.execute("SELECT 1 FROM Users WHERE id=%s AND LOWER(parent_user)=LOWER(%s)", (t_id, me["username"]))
+        return t_id != me["id"] and is_direct_child(c, me, t_id)
     else:
         return False
     return bool(c.fetchone())
@@ -268,9 +292,7 @@ def get_rate_targets(c, me):
     c.execute("SELECT id, name FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY id DESC", (me["username"],))
     for r in c.fetchall():
         out.append({"key": str(r[0]), "kind": "Customer", "id": r[0], "label": f"ลูกค้า: {r[1]}"})
-    c.execute("SELECT id, username FROM Users WHERE LOWER(parent_user)=LOWER(%s) AND id<>%s ORDER BY id DESC",
-              (me["username"], me["id"]))
-    for r in c.fetchall():
+    for r in direct_children(c, me):
         out.append({"key": f"user_{r[0]}", "kind": "User", "id": r[0], "label": f"สายงาน: {r[1]}"})
     return out
 
@@ -309,18 +331,11 @@ def get_targets(c, me, include_self=True):
     if include_self:
         out.append({"key": f"user_{me['id']}", "kind": "User", "id": me["id"],
                     "label": f"user: {me['username']} (บัญชีตัวเอง)"})
-    if me["role"] == "Admin":
-        c.execute("SELECT id, name, owner_username FROM Customers ORDER BY id DESC")
-        custs = c.fetchall()
-        c.execute("SELECT id, username FROM Users WHERE id<>%s ORDER BY id DESC", (me["id"],))
-        users = c.fetchall()
-    else:
-        c.execute("SELECT id, name, owner_username FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY id DESC",
-                  (me["username"],))
-        custs = c.fetchall()
-        c.execute("SELECT id, username FROM Users WHERE LOWER(parent_user)=LOWER(%s) AND id<>%s ORDER BY id DESC",
-                  (me["username"], me["id"]))
-        users = c.fetchall()
+    # ทุกบทบาท (รวมแอดมิน): เฉพาะลูกค้าที่ตัวเองสร้าง และผู้ใช้ที่ตัวเองเป็น upline โดยตรง
+    c.execute("SELECT id, name, owner_username FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY id DESC",
+              (me["username"],))
+    custs = c.fetchall()
+    users = [(r[0], r[1]) for r in direct_children(c, me)]
     for r in custs:
         out.append({"key": str(r[0]), "kind": "Customer", "id": r[0], "label": f"ลูกค้า: {r[1]}"})
     for r in users:
@@ -767,8 +782,7 @@ def live_sales_data(c, root, node, f=""):
         rows.append({"kind": "customer", "name": r[1] or f"ลูกค้า #{r[0]}", "key": None, **d})
 
     # 2) ผู้ใช้ใต้สายงานโดยตรง (child) และยอดที่ node คีย์ให้ผู้ใช้เหล่านั้น
-    c.execute("SELECT id, username, role FROM Users WHERE LOWER(parent_user)=LOWER(%s) AND id<>%s", (node, nu["id"]))
-    children = {r[1]: {"id": r[0], "role": norm_role(r[2])} for r in c.fetchall()}
+    children = {r[1]: {"id": r[0], "role": norm_role(r[2])} for r in direct_children(c, nu)}
     by_child = {u: _zero() for u in children}
     if children:
         sub = [u for u in get_subtree(c, node) if u != node]
@@ -776,10 +790,10 @@ def live_sales_data(c, root, node, f=""):
         if sub:
             c.execute("SELECT username, parent_user FROM Users WHERE username = ANY(%s)", (sub,))
             parent = {r[0]: r[1] for r in c.fetchall()}
-            for u in sub:                                   # หา child ชั้นแรกที่เป็นต้นสายของ u
+            for u in sub:                                   # หา child ชั้นแรกที่เป็นต้นสายของ u (หรือ u เอง)
                 cur, guard = u, 0
-                while cur and (parent.get(cur) or "").lower() != node.lower() and guard < 50:
-                    cur, guard = parent.get(cur), guard + 1
+                while cur and cur not in children and guard < 50:
+                    cur, guard = (parent.get(cur) or None), guard + 1
                 if cur in children:
                     owner_of[u] = cur
             c.execute(f"SELECT username, {_SALES_COLS} FROM Transactions WHERE username = ANY(%s){where} GROUP BY username",
@@ -814,7 +828,13 @@ def live_sales_data(c, root, node, f=""):
         if d["items"]:
             rows.append({"kind": "upline", "name": f"คีย์ให้โดย upline ({nu['parent_user']})", "key": None, **d})
 
-    rows = [r for r in rows if r["items"] or r["kind"] == "user"]
+    # ลูกค้าของ node ที่ยังไม่มียอด แสดงเป็น 0 เพื่อให้เห็นครบทุกราย
+    c.execute("SELECT id, name FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY name", (node,))
+    have = {r["name"] for r in rows if r["kind"] == "customer"}
+    for cid, cname in c.fetchall():
+        if (cname or f"ลูกค้า #{cid}") not in have:
+            rows.append({"kind": "customer", "name": cname or f"ลูกค้า #{cid}", "key": None, **_zero()})
+    rows = [r for r in rows if r["items"] or r["kind"] in ("user", "customer")]
     for r in rows:
         _add(total, {k: r[k] for k in total})
     rows.sort(key=lambda r: (-r["amount"], r["name"]))

@@ -217,7 +217,7 @@ def can_use_target(c, user, role, c_id, c_type):
     if c_type == "Customer":
         c.execute("SELECT 1 FROM Customers WHERE id=%s AND LOWER(owner_username)=LOWER(%s)", (cid, user))
     elif c_type == "User":
-        c.execute("SELECT 1 FROM Users WHERE id=%s AND LOWER(parent_user)=LOWER(%s)", (cid, user))
+        return common.is_direct_child(c, common.get_user(c, user), cid)
     else:
         return False
     return bool(c.fetchone())
@@ -1517,8 +1517,8 @@ def buy_page(user: str, draw: str, selected: str = None, msg: str = None):
         # ทุกบทบาท (รวมแอดมิน) เห็นเฉพาะลูกค้าและบัญชีสายงานที่ "ตัวเองเป็นผู้สร้าง" (ไม่เจาะลึกลงไปชั้นถัดไป)
         c.execute("SELECT id, name, 'Customer' FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY name", (user,))
         custs = c.fetchall()
-        c.execute("SELECT id, username, 'User' FROM Users WHERE LOWER(parent_user)=LOWER(%s) AND username <> %s ORDER BY username", (user, user))
-        agents = c.fetchall()
+        me_row = common.get_user(c, user)
+        agents = sorted([(r[0], r[1], 'User') for r in common.direct_children(c, me_row)], key=lambda x: x[1].lower())
         all_targets = custs + agents
         if not selected and all_targets: selected = f"{all_targets[0][0]}|{all_targets[0][1]}|{all_targets[0][2]}"
         
@@ -2091,7 +2091,8 @@ def users_page(user: str, draw: str, msg: str = None, error: str = None):
         conn = connect_db(); c = conn.cursor()
         c.execute("SELECT role FROM Users WHERE username=%s", (user,))
         role = c.fetchone()[0]
-        c.execute("SELECT id, username, role, parent_user, password, disc_total, disc_3d, disc_2d, pay_3d, pay_3tod, pay_2d, disc_run, pay_run_top, pay_run_bot FROM Users WHERE LOWER(parent_user)=LOWER(%s) AND username<>%s ORDER BY id", (user, user))
+        kids = [r[0] for r in common.direct_children(c, common.get_user(c, user))]
+        c.execute("SELECT id, username, role, parent_user, password, disc_total, disc_3d, disc_2d, pay_3d, pay_3tod, pay_2d, disc_run, pay_run_top, pay_run_bot FROM Users WHERE id = ANY(%s) ORDER BY id", (kids,))
         users_list = c.fetchall(); conn.close()
         draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
         close_t = get_current_campaign_close_time(draw_clean)
