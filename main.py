@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Form, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from jinja2 import Template as _JinjaTemplate
 import psycopg2
 from datetime import datetime, timedelta
@@ -60,7 +60,7 @@ _PUBLIC_PATHS = {"/", "/login", "/logout"}
 _ADMIN_ONLY = {
     "/create-campaign", "/update-campaign", "/toggle-campaign",
     "/blocked-numbers", "/save-blocked", "/update-blocked", "/delete-blocked", "/clear-blocked",
-    "/results", "/save-results", "/audit-all", "/db-inspector",
+    "/results", "/save-results", "/audit-all", "/db-inspector", "/live-sales", "/live-sales-data",
     "/system-reset", "/execute-system-reset",
 }
 _MANAGER_ONLY = {"/users", "/save-user-level"}
@@ -323,6 +323,7 @@ LAYOUT = """
             <a href="/dashboard?user={{ username }}&draw={{ draw_date|urlencode }}">📊 แดชบอร์ด</a>
             <a href="/buy?user={{ username }}&draw={{ draw_date|urlencode }}">🛒 บันทึกโพย</a>
             {% if role == 'Admin' %}
+            <a href="/live-sales?user={{ username }}&draw={{ draw_date|urlencode }}">📈 ยอดขายสด</a>
             <a href="/audit-all?user={{ username }}&draw={{ draw_date|urlencode }}">🔍 ตรวจสอบทั้งหมด</a>
             <a href="/results?user={{ username }}&draw={{ draw_date|urlencode }}">🏆 ออกผลรางวัล</a>
             <a href="/db-inspector?user={{ username }}&draw={{ draw_date|urlencode }}">🗄️ ตรวจสอบ DB</a>
@@ -523,7 +524,7 @@ def execute_system_reset(username: str = Form(...), admin_password: str = Form(.
         return RedirectResponse(url="/system-reset?" + urlencode({"user": username, "error": "เกิดข้อผิดพลาดในการรีเซ็ต ข้อมูลไม่ถูกเปลี่ยนแปลง"}), status_code=303)
 
 CAMPAIGN_TEMPLATE = """
-<div class="container my-3" style="max-width: 900px;">
+<div class="container-fluid my-3 px-3">
     {% if missing_close_time_campaigns %}
     <div class="alert alert-danger border border-danger shadow p-3 mb-4 rounded">
         <h5 class="fw-bold text-danger"><i class="fa-solid fa-triangle-exclamation"></i> แจ้งเตือนสำคัญ: พบงวดหวยที่ยังไม่ได้กำหนด "เวลาปิดรับ" จำนวน {{ missing_close_time_campaigns | length }} งวด</h5>
@@ -553,9 +554,12 @@ CAMPAIGN_TEMPLATE = """
                         <label class="form-label fw-bold text-dark">งวดวันที่:</label>
                         <input type="text" name="draw_date" class="form-control" value="{{ edit_campaign[1] }}" required>
                     </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-bold text-danger">⏰ เวลาปิดรับแทง (บังคับระบุ):</label>
-                        <input type="datetime-local" name="close_time" class="form-control" value="{{ edit_campaign[4] }}" required>
+                    <div class="row mb-3">
+                        <div class="col-md-6"><label class="form-label fw-bold text-success">🟢 เวลาเปิดรับแทง:</label>
+                        <input type="datetime-local" name="open_time" class="form-control" value="{{ edit_campaign[5] or '' }}" required></div>
+                        <div class="col-md-6"><label class="form-label fw-bold text-danger">⏰ เวลาปิดรับแทง:</label>
+                        <input type="datetime-local" name="close_time" class="form-control" value="{{ edit_campaign[4] or '' }}" required></div>
+                        <div class="form-text">ระบบเปิด-ปิดรับให้อัตโนมัติตามเวลาที่กำหนด (ก่อนเวลาเปิด/หลังเวลาปิดจะบันทึกโพยไม่ได้)</div>
                     </div>
                     <div class="d-flex gap-2">
                         <button type="submit" class="btn btn-warning w-100 fw-bold py-2">💾 บันทึกการแก้ไข</button>
@@ -576,109 +580,20 @@ CAMPAIGN_TEMPLATE = """
                         <label class="form-label fw-bold text-dark">งวดวันที่:</label>
                         <input type="text" name="draw_date" class="form-control" placeholder="เช่น 16 ตุลาคม 2026" required>
                     </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-bold text-danger">⏰ เวลาปิดรับแทง (บังคับระบุ):</label>
-                        <input type="datetime-local" name="close_time" class="form-control" required>
+                    <div class="row mb-3">
+                        <div class="col-md-6"><label class="form-label fw-bold text-success">🟢 เวลาเปิดรับแทง:</label>
+                        <input type="datetime-local" name="open_time" class="form-control" value="{{ now_local }}" required></div>
+                        <div class="col-md-6"><label class="form-label fw-bold text-danger">⏰ เวลาปิดรับแทง:</label>
+                        <input type="datetime-local" name="close_time" class="form-control" required></div>
+                        <div class="form-text">ระบบเปิด-ปิดรับให้อัตโนมัติตามเวลาที่กำหนด</div>
                     </div>
-                    <button type="submit" class="btn btn-primary w-100 fw-bold py-2">เปิดงวดใหม่พร้อมเวลาปิดรับ</button>
+                    <button type="submit" class="btn btn-primary w-100 fw-bold py-2">เปิดงวดใหม่ (กำหนดเวลาเปิด-ปิดรับ)</button>
                 </form>
             </div>
             {% endif %}
         {% endif %}
         
-        <ul class="nav nav-tabs fw-bold mb-3" id="campaignTab" role="tablist">
-            <li class="nav-item" role="presentation">
-                <button class="nav-link active text-primary" id="active-tab" data-bs-toggle="tab" data-bs-target="#active" type="button" role="tab" aria-controls="active" aria-selected="true">
-                    🟢 งวดที่กำลังเปิด และ รอผลรางวัล
-                </button>
-            </li>
-            {% if role == 'Admin' %}
-            <li class="nav-item" role="presentation">
-                <button class="nav-link text-secondary" id="history-tab" data-bs-toggle="tab" data-bs-target="#history" type="button" role="tab" aria-controls="history" aria-selected="false">
-                    📁 งวดที่ปิดแล้ว (ประวัติย้อนหลัง)
-                </button>
-            </li>
-            {% endif %}
-        </ul>
-
-        <div class="tab-content" id="campaignTabContent">
-            <div class="tab-pane fade show active" id="active" role="tabpanel" aria-labelledby="active-tab">
-                <div class="list-group">
-                    {% for camp in active_campaigns %}
-                        {% set l_name = camp['lotto_name'] %}
-                        {% if 'รัฐบาล' in l_name or 'ไทย' in l_name %} {% set img_url = 'https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Flag_of_Thailand.svg/1024px-Flag_of_Thailand.svg.png' %}
-                        {% elif 'ลาว' in l_name %} {% set img_url = 'https://upload.wikimedia.org/wikipedia/commons/thumb/5/56/Flag_of_Laos.svg/1024px-Flag_of_Laos.svg.png' %}
-                        {% elif 'ฮานอย' in l_name or 'เวียดนาม' in l_name %} {% set img_url = 'https://upload.wikimedia.org/wikipedia/commons/thumb/2/21/Flag_of_Vietnam.svg/1024px-Flag_of_Vietnam.svg.png' %}
-                        {% elif 'มาเลย์' in l_name %} {% set img_url = 'https://upload.wikimedia.org/wikipedia/commons/thumb/6/66/Flag_of_Malaysia.svg/1024px-Flag_of_Malaysia.svg.png' %}
-                        {% elif 'หุ้น' in l_name %} {% set img_url = 'https://cdn-icons-png.flaticon.com/512/3061/3061292.png' %}
-                        {% elif 'ยี่กี' in l_name or 'ปิงปอง' in l_name %} {% set img_url = 'https://cdn-icons-png.flaticon.com/512/868/868776.png' %}
-                        {% else %} {% set img_url = 'https://cdn-icons-png.flaticon.com/512/5359/5359877.png' %}
-                        {% endif %}
-
-                        <div class="list-group-item list-group-item-light py-3 mb-2 d-flex justify-content-between align-items-center border shadow-sm rounded {% if not camp['close_time'] %}border-danger bg-danger-subtle{% endif %}">
-                            <div class="d-flex align-items-center">
-                                <div class="me-3 shadow-sm rounded-circle overflow-hidden bg-white border border-warning d-flex align-items-center justify-content-center" style="width: 60px; height: 60px; flex-shrink: 0;">
-                                    <img src="{{ img_url }}" alt="lotto-logo" style="width: 100%; height: 100%; object-fit: cover;">
-                                </div>
-                                <div>
-                                    <a href="/buy?user={{ username }}&draw={{ (camp['lotto_name'] ~ ' งวด ' ~ camp['draw_date'])|urlencode }}" class="text-primary text-decoration-none fs-5 fw-bold">
-                                        {{ camp['lotto_name'] }} งวดวันที่ {{ camp['draw_date'] }}
-                                    </a>
-                                    <div class="small text-muted mt-1">
-                                        สถานะ: 
-                                        {% if camp['status'] == 'รอผลรางวัล' %}
-                                            <span class="badge bg-warning text-dark">{{ camp['status'] }}</span>
-                                        {% elif camp['status'] == 'เปิดรับแทง' %}
-                                            <span class="badge bg-success">{{ camp['status'] }}</span>
-                                        {% else %}
-                                            <span class="badge bg-secondary">{{ camp['status'] }}</span>
-                                        {% endif %}
-                                        | ⏰ ปิดรับ: <b class="text-danger">{{ camp['close_time']|replace("T", " ") if camp['close_time'] else '⚠️ ยังไม่ได้ระบุ' }}</b>
-                                    </div>
-                                </div>
-                            </div>
-                            {% if role == 'Admin' %}
-                            <div class="d-flex flex-column gap-2">
-                                <a href="/campaigns?user={{ username }}&edit_id={{ camp['id'] }}" class="btn btn-warning btn-sm fw-bold">✏️ แก้ไข</a>
-                                <a href="/toggle-campaign?id={{ camp['id'] }}&user={{ username }}" class="btn btn-outline-dark btn-sm fw-bold">สลับปิด-เปิด</a>
-                            </div>
-                            {% endif %}
-                        </div>
-                    {% else %}
-                        <div class="text-center text-muted py-4">ไม่มีงวดที่กำลังเปิดรับแทงหรือรอผล</div>
-                    {% endfor %}
-                </div>
-            </div>
-
-            {% if role == 'Admin' %}
-            <div class="tab-pane fade" id="history" role="tabpanel" aria-labelledby="history-tab">
-                <div class="list-group">
-                    {% for camp in closed_campaigns %}
-                        <div class="list-group-item bg-light text-muted py-3 mb-2 d-flex justify-content-between align-items-center border shadow-sm rounded">
-                            <div class="d-flex align-items-center opacity-75">
-                                <div class="fs-1 me-3 text-secondary"><i class="fa-solid fa-box-archive"></i></div>
-                                <div>
-                                    <a href="/buy?user={{ username }}&draw={{ (camp['lotto_name'] ~ ' งวด ' ~ camp['draw_date'])|urlencode }}" class="text-secondary text-decoration-none fs-5 fw-bold">
-                                        {{ camp['lotto_name'] }} งวดวันที่ {{ camp['draw_date'] }}
-                                    </a>
-                                    <div class="small mt-1">
-                                        สถานะ: <span class="badge bg-secondary">{{ camp['status'] }}</span> | 
-                                        ออกผลแล้วเมื่อ: <b>{{ camp['result_time'] }}</b>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="d-flex flex-column gap-2">
-                                <a href="/campaigns?user={{ username }}&edit_id={{ camp['id'] }}" class="btn btn-outline-secondary btn-sm fw-bold">✏️ แก้ไข</a>
-                                <a href="/toggle-campaign?id={{ camp['id'] }}&user={{ username }}" class="btn btn-outline-dark btn-sm fw-bold">เปิดใช้งานอีกครั้ง</a>
-                            </div>
-                        </div>
-                    {% else %}
-                        <div class="text-center text-muted py-4">ยังไม่มีประวัติงวดที่ปิดแล้วเกิน 2 วัน</div>
-                    {% endfor %}
-                </div>
-            </div>
-            {% endif %}
-        </div>
+        {{ cards_html|safe }}
     </div>
 </div>
 """
@@ -1409,68 +1324,75 @@ def campaigns_page(user: str, edit_id: int = None, msg: str = None, error: str =
         user_res = c.fetchone()
         role = user_res[0] if user_res else "Member"
 
-        c.execute("SELECT lotto_name, draw_date, status, id, close_time, result_timestamp FROM LotteryCampaigns ORDER BY id DESC")
-        campaigns = c.fetchall()
-
-        now = get_thai_time()
-        active_camps, closed_camps, missing_close = [], [], []
-
-        for camp in campaigns:
-            l_name, d_date, stat, c_id, c_time, r_time = camp
-            display_status = "เปิดรับแทง"
-            is_closed = False
-
-            if not c_time: missing_close.append({"id": c_id, "draw_date": d_date})
-            if c_time:
-                try:
-                    ct = datetime.strptime(c_time, "%Y-%m-%dT%H:%M")
-                    if now >= ct: display_status = "รอผลรางวัล"
-                except: pass
-            if r_time:
-                try:
-                    rt = datetime.strptime(r_time, "%Y-%m-%d %H:%M:%S")
-                    if (now - rt).total_seconds() >= (2 * 24 * 3600):
-                        display_status = "ปิดงวด"
-                        is_closed = True
-                except: pass
-            if stat == 'Closed':
-                display_status = "ปิดงวด"
-                is_closed = True
-
-            camp_dict = {"lotto_name": l_name, "draw_date": d_date, "status": display_status, "id": c_id, "close_time": c_time, "result_time": r_time}
-            if is_closed: closed_camps.append(camp_dict)
-            else: active_camps.append(camp_dict)
+        c.execute("SELECT id, lotto_name, draw_date, status, open_time, close_time, result_timestamp "
+                  "FROM LotteryCampaigns ORDER BY id DESC LIMIT 400")
+        rows = [dict(id=r[0], lotto_name=r[1], draw_date=r[2], status=r[3], open_time=r[4], close_time=r[5],
+                     result_timestamp=r[6]) for r in c.fetchall()]
+        missing_close = [{"id": r["id"], "draw_date": r["draw_date"]} for r in rows
+                         if not r["close_time"] and r["status"] == "Active"]
 
         edit_campaign = None
-        if edit_id:
-            c.execute("SELECT lotto_name, draw_date, status, id, close_time FROM LotteryCampaigns WHERE id=%s", (edit_id,))
+        if edit_id and role == "Admin":
+            c.execute("SELECT lotto_name, draw_date, status, id, close_time, open_time FROM LotteryCampaigns WHERE id=%s", (edit_id,))
             edit_campaign = c.fetchone()
-
         conn.close()
-        content = Template(CAMPAIGN_TEMPLATE).render(username=user, role=role, active_campaigns=active_camps, closed_campaigns=closed_camps, missing_close_time_campaigns=missing_close, edit_campaign=edit_campaign)
+
+        def href(r):
+            return "/buy?" + urlencode({"user": user, "draw": f"{common.clean_name(r['lotto_name'])} งวด {common.clean_name(r['draw_date'])}"})
+
+        def actions(r):
+            if role != "Admin":
+                return []
+            return [("✏️ แก้ไข", "/campaigns?" + urlencode({"user": user, "edit_id": r["id"]})),
+                    ("🔁 เปิด/ปิดงวด", "/toggle-campaign?" + urlencode({"id": r["id"], "user": user}))]
+
+        cards_html = common.render_campaign_cards(rows, href, actions, show_old_toggle=True)
+        content = Template(CAMPAIGN_TEMPLATE).render(
+            username=user, role=role, missing_close_time_campaigns=missing_close, edit_campaign=edit_campaign,
+            cards_html=cards_html, now_local=get_thai_time().strftime("%Y-%m-%dT%H:%M"))
         return Template(LAYOUT).render(username=user, role=role, draw_date="หน้าหลักจัดการงวด", content=content, current_close_time=None, msg=msg, error=error)
-    except Exception as e: return f"System Error: {str(e)}"
+    except Exception as e: return route_error(e)
+
+def _campaign_times(user, open_time, close_time, back_extra=None):
+    """ตรวจเวลาเปิด/ปิดรับ: ต้องระบุทั้งคู่ และเวลาปิดต้องหลังเวลาเปิด"""
+    ot, ct = common.normalize_dt(open_time), common.normalize_dt(close_time)
+    if not ot or not ct:
+        return None, None, "กรุณาระบุเวลาเปิดรับและเวลาปิดรับให้ถูกต้อง"
+    if ct <= ot:
+        return None, None, "เวลาปิดรับต้องอยู่หลังเวลาเปิดรับ"
+    return ot, ct, None
+
 
 @app.post("/create-campaign")
-def create_campaign(user: str = Form(...), lotto_name: str = Form(...), draw_date: str = Form(...), close_time: str = Form(...)):
+def create_campaign(user: str = Form(...), lotto_name: str = Form(...), draw_date: str = Form(...),
+                    open_time: str = Form(...), close_time: str = Form(...)):
     lotto_name, draw_date = common.clean_name(lotto_name), common.clean_name(draw_date)
+    ot, ct, err = _campaign_times(user, open_time, close_time)
+    if err or not lotto_name or not draw_date:
+        return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "error": err or "กรุณาระบุชื่อหวยและงวด"}), status_code=303)
     try:
         conn = connect_db()
         c = conn.cursor()
-        c.execute("INSERT INTO LotteryCampaigns (lotto_name, draw_date, status, close_time) VALUES (%s, %s, 'Active', %s)", (lotto_name, draw_date, close_time))
+        c.execute("INSERT INTO LotteryCampaigns (lotto_name, draw_date, status, open_time, close_time) VALUES (%s, %s, 'Active', %s, %s)",
+                  (lotto_name, draw_date, ot, ct))
         conn.commit(); conn.close()
-        return RedirectResponse(url=f"/campaigns?user={_q(user)}&msg=สร้างงวดหวยสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "msg": "สร้างงวดหวยสำเร็จ"}), status_code=303)
     except Exception as e: return route_error(e)
 
 @app.post("/update-campaign")
-def update_campaign(user: str = Form(...), campaign_id: int = Form(...), lotto_name: str = Form(...), draw_date: str = Form(...), close_time: str = Form(...)):
+def update_campaign(user: str = Form(...), campaign_id: int = Form(...), lotto_name: str = Form(...), draw_date: str = Form(...),
+                    open_time: str = Form(...), close_time: str = Form(...)):
     lotto_name, draw_date = common.clean_name(lotto_name), common.clean_name(draw_date)
+    ot, ct, err = _campaign_times(user, open_time, close_time)
+    if err or not lotto_name or not draw_date:
+        return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "edit_id": campaign_id, "error": err or "กรุณาระบุชื่อหวยและงวด"}), status_code=303)
     try:
         conn = connect_db()
         c = conn.cursor()
-        c.execute("UPDATE LotteryCampaigns SET lotto_name=%s, draw_date=%s, close_time=%s WHERE id=%s", (lotto_name, draw_date, close_time, campaign_id))
+        c.execute("UPDATE LotteryCampaigns SET lotto_name=%s, draw_date=%s, open_time=%s, close_time=%s WHERE id=%s",
+                  (lotto_name, draw_date, ot, ct, campaign_id))
         conn.commit(); conn.close()
-        return RedirectResponse(url=f"/campaigns?user={_q(user)}&msg=แก้ไขสำเร็จ", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "msg": "แก้ไขสำเร็จ"}), status_code=303)
     except Exception as e: return route_error(e)
 
 @app.get("/toggle-campaign")
@@ -1656,11 +1578,11 @@ def add_draft(user: str = Form(...), draw: str = Form(...), customer_info: str =
             r = c.fetchone()
             lotto_name = r[0] if r else ""
         # เช็คสถานะงวด/เวลาปิดรับ ฝั่งเซิร์ฟเวอร์
-        c.execute("SELECT status, close_time FROM LotteryCampaigns WHERE lotto_name=%s AND (draw_date=%s OR draw_date ILIKE %s) "
+        c.execute("SELECT status, close_time, open_time FROM LotteryCampaigns WHERE lotto_name=%s AND (draw_date=%s OR draw_date ILIKE %s) "
                   "ORDER BY id DESC LIMIT 1", (lotto_name, draw_clean, f"%{common.like_escape(draw_clean)}%"))
         camp = c.fetchone()
         if camp:
-            ok, reason = common.campaign_open({"status": camp[0], "close_time": camp[1]})
+            ok, reason = common.campaign_open({"status": camp[0], "close_time": camp[1], "open_time": camp[2]})
             if not ok:
                 return back_to_buy(user, draw, customer_info, msg=reason)
         rates, _src = common.get_rates(c, key, lotto_name)
@@ -1821,11 +1743,11 @@ def confirm_bill(user: str = Form(...), draw: str = Form(...), customer_info: st
         c_name = common.get_target_name(c, c_type, int(c_id)) or ""
 
         # 1) ตรวจงวด / เวลาปิดรับ ฝั่งเซิร์ฟเวอร์
-        c.execute("SELECT status, close_time FROM LotteryCampaigns WHERE lotto_name=%s AND (draw_date=%s OR draw_date ILIKE %s) "
+        c.execute("SELECT status, close_time, open_time FROM LotteryCampaigns WHERE lotto_name=%s AND (draw_date=%s OR draw_date ILIKE %s) "
                   "ORDER BY id DESC LIMIT 1", (lotto_name, draw_clean, f"%{common.like_escape(draw_clean)}%"))
         camp = c.fetchone()
         if camp:
-            ok, reason = common.campaign_open({"status": camp[0], "close_time": camp[1]})
+            ok, reason = common.campaign_open({"status": camp[0], "close_time": camp[1], "open_time": camp[2]})
             if not ok:
                 return back_to_buy(user, draw, customer_info, msg=reason + " ไม่สามารถออกบิลได้")
 
@@ -2098,12 +2020,9 @@ def customers_page(user: str, draw: str, msg: str = None, error: str = None, edi
         role = c.fetchone()[0]
         c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run FROM Customers WHERE owner_username=%s", (user,))
         custs_list = c.fetchall()
-        if not custs_list and role == 'Admin':
-            c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run FROM Customers")
-            custs_list = c.fetchall()
         edit_customer = None
         if edit_id:
-            c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run FROM Customers WHERE id=%s AND (LOWER(owner_username)=LOWER(%s) OR %s)", (edit_id, user, role == "Admin"))
+            c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run FROM Customers WHERE id=%s AND LOWER(owner_username)=LOWER(%s)", (edit_id, user))
             edit_customer = c.fetchone()
         conn.close()
         draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
@@ -2123,6 +2042,10 @@ def save_customer(user: str = Form(...), draw: str = Form(...), name: str = Form
         return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "error": "กรุณาระบุชื่อลูกค้า"}), status_code=303)
     try:
         conn = connect_db(); c = conn.cursor()
+        over = common.check_rates_within(c, common.get_user(c, user), v)
+        if over:
+            conn.close()
+            return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "error": over}), status_code=303)
         c.execute("INSERT INTO Customers (name, owner_username, discount_type, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot) "
                   "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                   (name, user, 1, v["disc_total"], v["disc_run"], v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"]))
@@ -2141,13 +2064,16 @@ def update_customer(user: str = Form(...), draw: str = Form(...), customer_id: i
     conn = connect_db()
     try:
         c = conn.cursor()
-        role = (common.get_user(c, user) or {}).get("role", "Member")
+        me = common.get_user(c, user)
         if not name:
             return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "error": "กรุณาระบุชื่อลูกค้า"}), status_code=303)
+        over = common.check_rates_within(c, me, v)
+        if over:
+            return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "edit_id": customer_id, "error": over}), status_code=303)
         c.execute("UPDATE Customers SET name=%s, disc_total=%s, disc_run=%s, pay_3d=%s, pay_3tod=%s, pay_2d=%s, pay_run_top=%s, pay_run_bot=%s "
-                  "WHERE id=%s AND (LOWER(owner_username)=LOWER(%s) OR %s)",
+                  "WHERE id=%s AND LOWER(owner_username)=LOWER(%s)",
                   (name, v["disc_total"], v["disc_run"], v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"],
-                   customer_id, user, role == "Admin"))
+                   customer_id, user))
         if c.rowcount == 0:
             conn.rollback()
             return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "error": "ไม่พบลูกค้า หรือคุณไม่มีสิทธิ์แก้ไขรายนี้"}), status_code=303)
@@ -2193,6 +2119,9 @@ def save_user_level(user: str = Form(...), draw: str = Form(...), new_username: 
             return back(error="Username ใช้ได้เฉพาะ a-z A-Z 0-9 _ . - ความยาว 3-50 ตัว")
         if len(new_password) < 6:
             return back(error="รหัสผ่านต้องมีอย่างน้อย 6 ตัว")
+        over = common.check_rates_within(c, me, v)
+        if over:
+            return back(error=over)
         c.execute("SELECT 1 FROM Users WHERE LOWER(username)=LOWER(%s)", (new_username,))
         if c.fetchone():
             return back(error="มี Username นี้อยู่แล้ว")
@@ -2260,6 +2189,9 @@ CUSTOMER_RATES_TEMPLATE = """
             <a href="/campaigns?user={{ username }}" class="btn btn-secondary">กลับหน้าหลัก</a>
         </div>
 
+        {% if error %}
+        <div class="alert alert-danger fw-bold">⚠️ {{ error }}</div>
+        {% endif %}
         {% if msg %}
         <div class="alert alert-success">{{ msg }}</div>
         {% endif %}
@@ -2269,11 +2201,11 @@ CUSTOMER_RATES_TEMPLATE = """
                 <input type="hidden" name="username" value="{{ username }}">
                 <div class="row g-3">
                     <div class="col-md-4">
-                        <label class="form-label fw-bold">1. เลือกลูกค้า:</label>
+                        <label class="form-label fw-bold">1. เลือกลูกค้า / สายงาน:</label>
                         <select name="customer_id" class="form-select" required>
-                            <option value="">-- เลือกลูกค้า --</option>
-                            {% for cust in customers %}
-                            <option value="{{ cust[0] }}">{{ cust[1] }} (เจ้าของ: {{ cust[2] }})</option>
+                            <option value="">-- เลือกลูกค้า / สายงาน --</option>
+                            {% for t in targets %}
+                            <option value="{{ t.key }}">{{ t.label }}</option>
                             {% endfor %}
                         </select>
                     </div>
@@ -2317,27 +2249,24 @@ CUSTOMER_RATES_TEMPLATE = """
 """
 
 @app.get("/customer-rates-page", response_class=HTMLResponse)
-def customer_rates_page(user: str, msg: str = None):
-    customers, lotto_list = [], []
+def customer_rates_page(user: str, msg: str = None, error: str = None):
+    targets, lotto_list = [], []
     try:
         conn = connect_db()
         c = conn.cursor()
         me = common.get_user(c, user)
-        if me and me["role"] == "Admin":
-            c.execute("SELECT id, name, owner_username FROM Customers ORDER BY id DESC")
-        else:
-            c.execute("SELECT id, name, owner_username FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY id DESC", (user,))
-        customers = c.fetchall()
+        if me:
+            targets = common.get_rate_targets(c, me)      # ลูกค้าที่ตัวเองสร้าง + ผู้ใช้ที่ตัวเองเป็น upline โดยตรง
         c.execute("SELECT DISTINCT lotto_name FROM LotteryCampaigns WHERE lotto_name IS NOT NULL ORDER BY lotto_name")
-        lotto_list = [row[0] for row in c.fetchall()]
+        lotto_list = [common.clean_name(row[0]) for row in c.fetchall()]
         conn.close()
     except Exception as e:
         print("Load Customer Rates Error:", e)
-    return Template(CUSTOMER_RATES_TEMPLATE).render(username=user, customers=customers, lotto_list=lotto_list, msg=msg)
+    return Template(CUSTOMER_RATES_TEMPLATE).render(username=user, targets=targets, lotto_list=lotto_list, msg=msg, error=error)
 
 @app.post("/save-customer-lotto-rate")
 def save_customer_lotto_rate(
-    username: str = Form(...), customer_id: int = Form(...), lotto_name: str = Form(...),
+    username: str = Form(...), customer_id: str = Form(...), lotto_name: str = Form(...),
     pay_3d: float = Form(500), pay_3tod: float = Form(100), pay_2d: float = Form(70),
     pay_run_top: float = Form(3.2), pay_run_bot: float = Form(4.2),
     disc_3d: float = Form(0), disc_2d: float = Form(0), disc_run: float = Form(0), disc_total: float = Form(0)
@@ -2345,34 +2274,73 @@ def save_customer_lotto_rate(
     v = common.clean_rates(dict(pay_3d=pay_3d, pay_3tod=pay_3tod, pay_2d=pay_2d, pay_run_top=pay_run_top,
                                 pay_run_bot=pay_run_bot, disc_3d=disc_3d, disc_2d=disc_2d,
                                 disc_run=disc_run, disc_total=disc_total))
-    key = str(customer_id)
+    lotto_name = common.clean_name(lotto_name)
     cols = ", ".join(common.RATE_KEYS)
     conn = connect_db()
+    msg = err = None
     try:
         c = conn.cursor()
         me = common.get_user(c, username)
-        c.execute("SELECT 1 FROM Customers WHERE id=%s AND (LOWER(owner_username)=LOWER(%s) OR %s)",
-                  (customer_id, username, bool(me and me["role"] == "Admin")))
-        if not c.fetchone():
-            msg = "ไม่พบลูกค้า หรือคุณไม่มีสิทธิ์ตั้งเรตให้รายนี้"
+        try:
+            t_type, t_id = common.parse_target(customer_id)
+        except ValueError:
+            t_type = t_id = None
+        if not me or not lotto_name or not common.can_set_rates_for(c, me, t_type, t_id):
+            err = "ตั้งเรตได้เฉพาะลูกค้าที่คุณสร้างและผู้ใช้ที่คุณเป็น upline โดยตรง (ตั้งให้ตัวเองไม่ได้)"
         else:
+            err = common.check_rates_within(c, me, v, lotto_name)
+        if not err:
+            key = common.target_key(t_type, t_id)
             c.execute("DELETE FROM CustomerLottoRates WHERE target_id=%s AND lotto_name=%s", (key, lotto_name))
             c.execute(f"INSERT INTO CustomerLottoRates (customer_id, target_type, target_id, lotto_name, {cols}) "
-                      f"VALUES (%s,'Customer',%s,%s,{', '.join(['%s'] * len(common.RATE_KEYS))})",
-                      (customer_id, key, lotto_name, *[v[k] for k in common.RATE_KEYS]))
+                      f"VALUES (%s,%s,%s,%s,{', '.join(['%s'] * len(common.RATE_KEYS))})",
+                      (t_id if t_type == "Customer" else None, t_type, key, lotto_name, *[v[k] for k in common.RATE_KEYS]))
             conn.commit()
             msg = "บันทึกเรตอัตราจ่ายและส่วนลดสำเร็จ!"
     except Exception as e:
         conn.rollback()
         print("save_customer_lotto_rate error:", e)
-        msg = "บันทึกไม่สำเร็จ กรุณาลองใหม่"
+        err = "บันทึกไม่สำเร็จ กรุณาลองใหม่"
     finally:
         conn.close()
-    return RedirectResponse(url="/customer-rates-page?" + urlencode({"user": username, "msg": msg}), status_code=303)
+    q = {"user": username}
+    if msg: q["msg"] = msg
+    if err: q["error"] = err
+    return RedirectResponse(url="/customer-rates-page?" + urlencode(q), status_code=303)
+
+
+
+@app.get("/live-sales", response_class=HTMLResponse)
+def live_sales_page(user: str, draw: str = "ยอดขายสด"):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me or me["role"] != "Admin":
+                return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "error": "เมนูนี้สำหรับแอดมินเท่านั้น"}), status_code=303)
+            inner = common.render_live_sales(c, "/live-sales-data")
+        content = Template("<div class='container-fluid'><h3 class='fw-bold text-primary mb-3'>📈 ยอดขายเรียลไทม์</h3>{{ inner|safe }}</div>").render(inner=inner)
+        return Template(LAYOUT).render(username=user, role="Admin", draw_date=draw, content=content, current_close_time=None)
+    except Exception as e: return route_error(e)
+
+
+@app.get("/live-sales-data")
+def live_sales_data_api(user: str, node: str = "", f: str = ""):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me or me["role"] != "Admin":
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            data = common.live_sales_data(c, user, node or user, f)
+        return JSONResponse(data)
+    except Exception as e:
+        print("live_sales_data error:", e)
+        return JSONResponse({"error": "server"}, status_code=500)
+
 
 @app.get("/logout")
 def logout():
     resp = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
     resp.delete_cookie(common.SESSION_COOKIE)
     return resp
-
