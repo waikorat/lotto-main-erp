@@ -1022,6 +1022,10 @@ MIGRATIONS = [
 
     # ---- DrawResults: ระบบหลักใช้ ON CONFLICT (draw_date) จึงต้องมี unique ----
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_drawresults_date ON DrawResults(draw_date)",
+    # บัญชีเก่าที่ไม่มี upline (parent_user ว่าง) -> ให้เป็นสายตรงของแอดมินคนแรก เพื่อให้โผล่ในรายชื่อและสิทธิ์ทำงานได้
+    "UPDATE Users SET parent_user = (SELECT username FROM Users WHERE role = 'Admin' ORDER BY id LIMIT 1) "
+    "WHERE (parent_user IS NULL OR BTRIM(parent_user) = '') AND role <> 'Admin' "
+    "AND EXISTS (SELECT 1 FROM Users WHERE role = 'Admin')",
     # ---- ล้างช่องว่าง/อักขระล่องหนที่หัวท้ายชื่อหวยและวันที่งวด (ทำให้เทียบชื่อไม่ตรงข้ามระบบ) — รันซ้ำได้ ----
     "UPDATE LotteryCampaigns SET lotto_name = regexp_replace(lotto_name, '^[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+|[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+$', '', 'g'), "
     "draw_date = regexp_replace(draw_date, '^[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+|[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+$', '', 'g') "

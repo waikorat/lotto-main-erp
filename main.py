@@ -2091,7 +2091,7 @@ def users_page(user: str, draw: str, msg: str = None, error: str = None):
         conn = connect_db(); c = conn.cursor()
         c.execute("SELECT role FROM Users WHERE username=%s", (user,))
         role = c.fetchone()[0]
-        c.execute("SELECT id, username, role, parent_user, password, disc_total, disc_3d, disc_2d, pay_3d, pay_3tod, pay_2d, disc_run, pay_run_top, pay_run_bot FROM Users WHERE parent_user=%s", (user,))
+        c.execute("SELECT id, username, role, parent_user, password, disc_total, disc_3d, disc_2d, pay_3d, pay_3tod, pay_2d, disc_run, pay_run_top, pay_run_bot FROM Users WHERE LOWER(parent_user)=LOWER(%s) AND username<>%s ORDER BY id", (user, user))
         users_list = c.fetchall(); conn.close()
         draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
         close_t = get_current_campaign_close_time(draw_clean)
