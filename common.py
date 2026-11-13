@@ -95,9 +95,9 @@ def _is_root_admin(c, me):
 
 def direct_children(c, me):
     """ผู้ใช้ที่ me เป็น upline โดยตรง -> [(id, username, role)]
-    บัญชีเก่าที่ไม่มี upline (parent_user ว่าง และไม่ใช่แอดมิน) ถือเป็นสายตรงของแอดมินคนแรก"""
+    บัญชีเก่าที่ไม่มี upline จริง (parent_user ว่าง/เป็นขีด "-"/ชื่อที่ไม่มีอยู่ในระบบ และไม่ใช่แอดมิน) ถือเป็นสายตรงของแอดมินคนแรก"""
     c.execute("SELECT id, username, role FROM Users WHERE id<>%s AND (LOWER(parent_user)=LOWER(%s) OR "
-              "(%s AND (parent_user IS NULL OR BTRIM(parent_user)='') AND LOWER(role)<>'admin')) ORDER BY id DESC",
+              "(%s AND NOT EXISTS (SELECT 1 FROM Users pp WHERE LOWER(pp.username) = LOWER(Users.parent_user)) AND LOWER(role)<>'admin')) ORDER BY id DESC",
               (me["id"], me["username"], _is_root_admin(c, me)))
     return c.fetchall()
 
@@ -119,7 +119,7 @@ def get_subtree(c, username):
                SELECT u.username FROM Users u JOIN t ON (
                    u.parent_user = t.username
                    OR (t.username = (SELECT username FROM Users WHERE LOWER(role)='admin' ORDER BY id LIMIT 1)
-                       AND (u.parent_user IS NULL OR BTRIM(u.parent_user) = '') AND LOWER(u.role) <> 'admin'))
+                       AND NOT EXISTS (SELECT 1 FROM Users pp WHERE LOWER(pp.username) = LOWER(u.parent_user)) AND LOWER(u.role) <> 'admin'))
            ) SELECT username FROM t""",
         (username,),
     )
@@ -722,7 +722,7 @@ def generate_bill_no(c, lotto_name, draw_date, t_type, t_id):
 
 # ============================================================ ยอดขายเรียลไทม์ (แอดมิน) + เจาะลึกตามสายงาน
 
-BUILD = "2026-11-13.4"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
+BUILD = "2026-11-13.5"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
 
 _SALES_COLS = "COALESCE(SUM(amount),0), COALESCE(SUM(discount),0), COALESCE(SUM(net),0), COUNT(DISTINCT bill_no), COUNT(*)"
 
@@ -1044,10 +1044,10 @@ MIGRATIONS = [
 
     # ---- DrawResults: ระบบหลักใช้ ON CONFLICT (draw_date) จึงต้องมี unique ----
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_drawresults_date ON DrawResults(draw_date)",
-    # บัญชีเก่าที่ไม่มี upline (parent_user ว่าง) -> ให้เป็นสายตรงของแอดมินคนแรก เพื่อให้โผล่ในรายชื่อและสิทธิ์ทำงานได้
-    "UPDATE Users SET parent_user = (SELECT username FROM Users WHERE role = 'Admin' ORDER BY id LIMIT 1) "
-    "WHERE (parent_user IS NULL OR BTRIM(parent_user) = '') AND role <> 'Admin' "
-    "AND EXISTS (SELECT 1 FROM Users WHERE role = 'Admin')",
+    # บัญชีเก่าที่ไม่มี upline จริง (parent_user ว่าง / "-" / ชื่อที่ไม่มีในระบบ) -> ให้เป็นสายตรงของแอดมินคนแรก
+    "UPDATE Users SET parent_user = (SELECT username FROM Users WHERE LOWER(role) = 'admin' ORDER BY id LIMIT 1) "
+    "WHERE LOWER(role) <> 'admin' AND NOT EXISTS (SELECT 1 FROM Users pp WHERE LOWER(pp.username) = LOWER(Users.parent_user)) "
+    "AND EXISTS (SELECT 1 FROM Users WHERE LOWER(role) = 'admin')",
     # ---- ล้างช่องว่าง/อักขระล่องหนที่หัวท้ายชื่อหวยและวันที่งวด (ทำให้เทียบชื่อไม่ตรงข้ามระบบ) — รันซ้ำได้ ----
     "UPDATE LotteryCampaigns SET lotto_name = regexp_replace(lotto_name, '^[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+|[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+$', '', 'g'), "
     "draw_date = regexp_replace(draw_date, '^[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+|[[:space:]\\u00a0\\u200b-\\u200d\\ufeff]+$', '', 'g') "
