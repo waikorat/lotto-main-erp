@@ -177,6 +177,7 @@ app.add_middleware(SessionAuthMiddleware)
 @app.on_event("startup")
 def startup_db():
     try:
+        print("common.py build:", common.BUILD)
         common.run_migrations()
     except Exception as e:
         print("Startup DB Init Warning:", e)

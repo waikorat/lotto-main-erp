@@ -722,6 +722,8 @@ def generate_bill_no(c, lotto_name, draw_date, t_type, t_id):
 
 # ============================================================ ยอดขายเรียลไทม์ (แอดมิน) + เจาะลึกตามสายงาน
 
+BUILD = "2026-11-13.4"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
+
 _SALES_COLS = "COALESCE(SUM(amount),0), COALESCE(SUM(discount),0), COALESCE(SUM(net),0), COUNT(DISTINCT bill_no), COUNT(*)"
 
 
@@ -847,7 +849,7 @@ def live_sales_data(c, root, node, f=""):
         u = get_user(c, cur)
         cur, guard = (u or {}).get("parent_user"), guard + 1
     path.reverse()
-    return {"node": node, "path": path, "rows": rows, "total": total,
+    return {"node": node, "path": path, "rows": rows, "total": total, "build": BUILD,
             "updated": get_thai_time().strftime("%d/%m/%Y %H:%M:%S")}
 
 
@@ -912,7 +914,7 @@ function draw(d){node=d.node;
  var t=mk('tr','ls-tot');t.appendChild(mk('td','','รวมทั้งหมด'));t.appendChild(mk('td'));
  [d.total.amount,d.total.discount,d.total.net].forEach(function(v){t.appendChild(mk('td','num',nf(v)));});
  t.appendChild(mk('td','num',d.total.bills));t.appendChild(mk('td','num',d.total.items));t.appendChild(mk('td'));t.appendChild(mk('td'));body.appendChild(t);
- document.getElementById('ls-upd').textContent='อัปเดตล่าสุด '+d.updated;}
+ document.getElementById('ls-upd').textContent='อัปเดตล่าสุด '+d.updated+' · รุ่น '+(d.build||'เก่า')+' · พบ '+d.rows.length+' รายการ';}
 sel.onchange=load;document.getElementById('ls-now').onclick=load;
 setInterval(function(){if(document.getElementById('ls-auto').checked&&!document.hidden)load();},5000);
 load();
