@@ -744,8 +744,8 @@ BUY_CONTENT = """
     <div class="col-lg-4">
         <div class="card shadow p-3 bg-white mb-4 border">
             <label class="fw-bold text-dark mb-1">เลขอั้นปิดรับ:</label><textarea class="form-control mb-3 bg-light text-danger fw-bold" rows="3" readonly>{{ block_closed }}</textarea>
-            <label class="fw-bold text-dark mb-1">เลขอั้น 3ตัว (จ่ายครึ่ง):</label><textarea class="form-control mb-3 bg-light text-dark" rows="3" readonly>{{ block_3d }}</textarea>
-            <label class="fw-bold text-dark mb-1">เลขอั้น 2ตัว (จ่ายครึ่ง):</label><textarea class="form-control bg-light text-dark" rows="3" readonly>{{ block_2d }}</textarea>
+            <label class="fw-bold text-dark mb-1">เลขอั้น 3ตัวตรง-โต๊ด ทุกกลับ(จ่ายครึ่ง):</label><textarea class="form-control mb-3 bg-light text-dark" rows="3" readonly>{{ block_3d }}</textarea>
+            <label class="fw-bold text-dark mb-1">เลขอั้น 2ตัว บน-ล่างและตัวกลับ(จ่ายครึ่ง):</label><textarea class="form-control bg-light text-dark" rows="3" readonly>{{ block_2d }}</textarea>
         </div>
 
         <div class="card shadow p-3 bg-white mb-4 border">
