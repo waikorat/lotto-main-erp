@@ -1380,6 +1380,13 @@ def create_campaign(user: str = Form(...), lotto_name: str = Form(...), draw_dat
         return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "msg": "สร้างงวดหวยสำเร็จ"}), status_code=303)
     except Exception as e: return route_error(e)
 
+@app.get("/create-campaign")
+@app.get("/update-campaign")
+def campaign_form_get_fallback(request: Request, user: str = ""):
+    """ถ้าเบราว์เซอร์ส่งฟอร์มมาเป็น GET (เช่น เปิดลิงก์ตรงๆ/โดน redirect) จะไม่ขึ้น 405 แต่พากลับหน้าจัดการงวดพร้อมแจ้งเตือน + บันทึก log"""
+    print("WARN: GET", request.url.path, "(ควรเป็น POST) query=", dict(request.query_params))
+    return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "error": "ส่งฟอร์มไม่สำเร็จ (คำขอไม่ใช่ POST) กรุณากรอกแล้วกดปุ่มบนหน้านี้อีกครั้ง"}), status_code=303)
+
 @app.post("/update-campaign")
 def update_campaign(user: str = Form(...), campaign_id: int = Form(...), lotto_name: str = Form(...), draw_date: str = Form(...),
                     open_time: str = Form(...), close_time: str = Form(...)):
