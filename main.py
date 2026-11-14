@@ -60,7 +60,7 @@ _PUBLIC_PATHS = {"/", "/login", "/logout"}
 _ADMIN_ONLY = {
     "/create-campaign", "/update-campaign", "/toggle-campaign",
     "/blocked-numbers", "/save-blocked", "/update-blocked", "/delete-blocked", "/clear-blocked",
-    "/results", "/save-results", "/audit-all", "/db-inspector", "/live-sales", "/live-sales-data",
+    "/results", "/save-results", "/audit-all", "/db-inspector",
     "/system-reset", "/execute-system-reset",
 }
 _MANAGER_ONLY = {"/users", "/save-user-level"}
@@ -323,8 +323,8 @@ LAYOUT = """
         <div class="top-nav-links">
             <a href="/dashboard?user={{ username }}&draw={{ draw_date|urlencode }}">📊 แดชบอร์ด</a>
             <a href="/buy?user={{ username }}&draw={{ draw_date|urlencode }}">🛒 บันทึกโพย</a>
-            {% if role == 'Admin' %}
             <a href="/live-sales?user={{ username }}&draw={{ draw_date|urlencode }}">📈 ยอดขายสด</a>
+            {% if role == 'Admin' %}
             <a href="/audit-all?user={{ username }}&draw={{ draw_date|urlencode }}">🔍 ตรวจสอบทั้งหมด</a>
             <a href="/results?user={{ username }}&draw={{ draw_date|urlencode }}">🏆 ออกผลรางวัล</a>
             <a href="/db-inspector?user={{ username }}&draw={{ draw_date|urlencode }}">🗄️ ตรวจสอบ DB</a>
@@ -2325,11 +2325,11 @@ def live_sales_page(user: str, draw: str = "ยอดขายสด"):
         with common.db() as conn:
             c = conn.cursor()
             me = common.get_user(c, user)
-            if not me or me["role"] != "Admin":
-                return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "error": "เมนูนี้สำหรับแอดมินเท่านั้น"}), status_code=303)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
             inner = common.render_live_sales(c, "/live-sales-data")
         content = Template("<div class='container-fluid'><h3 class='fw-bold text-primary mb-3'>📈 ยอดขายเรียลไทม์</h3>{{ inner|safe }}</div>").render(inner=inner)
-        return Template(LAYOUT).render(username=user, role="Admin", draw_date=draw, content=content, current_close_time=None)
+        return Template(LAYOUT).render(username=user, role=me["role"], draw_date=draw, content=content, current_close_time=None)
     except Exception as e: return route_error(e)
 
 
@@ -2339,9 +2339,9 @@ def live_sales_data_api(user: str, node: str = "", f: str = ""):
         with common.db() as conn:
             c = conn.cursor()
             me = common.get_user(c, user)
-            if not me or me["role"] != "Admin":
+            if not me:
                 return JSONResponse({"error": "forbidden"}, status_code=403)
-            data = common.live_sales_data(c, user, node or user, f)
+            data = common.live_sales_data(c, me["username"], node or user, f)
         return JSONResponse(data)
     except Exception as e:
         print("live_sales_data error:", e)
