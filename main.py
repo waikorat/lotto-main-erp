@@ -324,6 +324,7 @@ LAYOUT = """
             <a href="/dashboard?user={{ username }}&draw={{ draw_date|urlencode }}">📊 แดชบอร์ด</a>
             <a href="/buy?user={{ username }}&draw={{ draw_date|urlencode }}">🛒 บันทึกโพย</a>
             <a href="/live-sales?user={{ username }}&draw={{ draw_date|urlencode }}">📈 ยอดขายสด</a>
+            <a href="/risk-control?user={{ username }}&draw={{ draw_date|urlencode }}">🛡️ ควบคุมความเสี่ยง</a>
             {% if role == 'Admin' %}
             <a href="/audit-all?user={{ username }}&draw={{ draw_date|urlencode }}">🔍 ตรวจสอบทั้งหมด</a>
             <a href="/results?user={{ username }}&draw={{ draw_date|urlencode }}">🏆 ออกผลรางวัล</a>
@@ -2356,6 +2357,36 @@ def live_sales_data_api(user: str, node: str = "", f: str = ""):
         return JSONResponse(data)
     except Exception as e:
         print("live_sales_data error:", e)
+        return JSONResponse({"error": "server"}, status_code=500)
+
+
+@app.get("/risk-control", response_class=HTMLResponse)
+def risk_control_page(user: str, draw: str = "ควบคุมความเสี่ยง"):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            note = "แสดงยอดทั้งระบบ" if me["role"] == "Admin" else "แสดงเฉพาะยอดของคุณและสายงานใต้คุณ"
+            inner = common.render_risk(c, "/risk-data", note)
+        content = Template("<div class='container-fluid'><h3 class='fw-bold text-danger mb-3'>🛡️ ควบคุมความเสี่ยง (เรียลไทม์)</h3>{{ inner|safe }}</div>").render(inner=inner)
+        return Template(LAYOUT).render(username=user, role=me["role"], draw_date=draw, content=content, current_close_time=None)
+    except Exception as e: return route_error(e)
+
+
+@app.get("/risk-data")
+def risk_data_api(user: str, f: str = ""):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            data = common.risk_data(c, me["username"], f)
+        return JSONResponse(data)
+    except Exception as e:
+        print("risk_data error:", e)
         return JSONResponse({"error": "server"}, status_code=500)
 
 

@@ -722,7 +722,7 @@ def generate_bill_no(c, lotto_name, draw_date, t_type, t_id):
 
 # ============================================================ ยอดขายเรียลไทม์ (แอดมิน) + เจาะลึกตามสายงาน
 
-BUILD = "2026-11-13.5"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
+BUILD = "2026-11-15.1"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
 
 _SALES_COLS = "COALESCE(SUM(amount),0), COALESCE(SUM(discount),0), COALESCE(SUM(net),0), COUNT(DISTINCT bill_no), COUNT(*)"
 
@@ -1086,3 +1086,162 @@ def _seed_admin(conn):
     except Exception as e:
         conn.rollback()
         print("seed admin failed:", e)
+
+
+# ============================================================ ควบคุมความเสี่ยง (วิเคราะห์ยอดซื้อรายเลข แบบเรียลไทม์)
+
+def risk_options(c):
+    c.execute("SELECT id, lotto_name, draw_date, status FROM LotteryCampaigns ORDER BY (status='Active') DESC, id DESC LIMIT 60")
+    return [{"value": f"c:{r[0]}", "label": f"{clean_name(r[1])} งวด {clean_name(r[2])}" + ("" if r[3] == "Active" else " (ปิดแล้ว)")}
+            for r in c.fetchall()]
+
+
+def risk_data(c, root, f=""):
+    """วิเคราะห์ความเสี่ยงของงวดหนึ่ง: ถ้าเลขนั้นออก จะต้องจ่ายเท่าไร เทียบกับยอดสุทธิที่รับมา
+    ขอบเขต: แอดมินเห็นทั้งระบบ / ผู้ใช้อื่นเห็นเฉพาะยอดของตัวเองและสายงานใต้ตัวเอง
+    หมายเหตุ: ผลบน (3 หลัก) และผลล่าง (2 หลัก) ออกแยกกัน จึงรวมกรณีเลวร้ายสุดของสองฝั่ง"""
+    me = get_user(c, root)
+    if not me:
+        return None
+    if not (f or "").startswith("c:"):
+        opts = risk_options(c)
+        f = opts[0]["value"] if opts else ""
+    camp = get_campaign(c, int(f[2:])) if f.startswith("c:") and f[2:].isdigit() else None
+    if not camp:
+        return {"error": "ยังไม่มีงวดหวย", "build": BUILD, "updated": get_thai_time().strftime("%d/%m/%Y %H:%M:%S")}
+    where, wargs = _sales_filter(c, f)
+    if me["role"] != "Admin":
+        where += " AND username = ANY(%s)"
+        wargs = (*wargs, get_subtree(c, me["username"]))
+    c.execute(f"SELECT num, type, COALESCE(SUM(amount),0), COALESCE(SUM(amount*payout_rate),0), COALESCE(SUM(net),0) "
+              f"FROM Transactions WHERE 1=1{where} GROUP BY num, type", wargs)
+    rows = c.fetchall()
+    half = {n for n, st in get_blocked_map(c, camp["lotto_name"], camp["draw_date"]).items() if st == "จ่ายครึ่ง"}
+
+    items, total_amt, total_net = [], 0.0, 0.0
+    p3, tod, tod_tot, p2t, p2b, rt, rb = {}, {}, {}, {}, {}, {}, {}
+    for num, t, amt, pay, net in rows:
+        n, t = str(num).strip(), str(t).strip()
+        amt, pay, net = float(amt), float(pay), float(net)
+        is_half = n in half
+        if is_half:
+            pay /= 2.0
+        total_amt += amt
+        total_net += net
+        items.append({"num": n, "type": t, "amount": amt, "pay": pay, "half": is_half})
+        if t == "3ตัวตรง":
+            p3[n] = p3.get(n, 0) + pay
+        elif t == "3ตัวโต๊ด":
+            k = "".join(sorted(n))
+            tod.setdefault(k, {})[n] = tod.setdefault(k, {}).get(n, 0) + pay
+            tod_tot[k] = tod_tot.get(k, 0) + pay
+        elif t == "2ตัวบน":
+            p2t[n] = p2t.get(n, 0) + pay
+        elif t == "2ตัวล่าง":
+            p2b[n] = p2b.get(n, 0) + pay
+        elif t == "วิ่งบน":
+            rt[n] = rt.get(n, 0) + pay
+        elif t == "วิ่งล่าง":
+            rb[n] = rb.get(n, 0) + pay
+
+    tops = []
+    for i in range(1000):
+        r = f"{i:03d}"
+        k = "".join(sorted(r))
+        pay = (p3.get(r, 0) + tod_tot.get(k, 0) - tod.get(k, {}).get(r, 0) + p2t.get(r[-2:], 0)
+               + sum(rt.get(d, 0) for d in set(r)))
+        if pay > 0:
+            tops.append({"num": r, "pay": pay})
+    bots = []
+    for i in range(100):
+        r = f"{i:02d}"
+        pay = p2b.get(r, 0) + sum(rb.get(d, 0) for d in set(r))
+        if pay > 0:
+            bots.append({"num": r, "pay": pay})
+    tops.sort(key=lambda x: -x["pay"])
+    bots.sort(key=lambda x: -x["pay"])
+    worst_top = tops[0]["pay"] if tops else 0.0
+    worst_bot = bots[0]["pay"] if bots else 0.0
+    items.sort(key=lambda x: (-x["pay"], -x["amount"]))
+    for lst in (tops, bots, items):
+        for x in lst:
+            x["level"] = ("high" if x["pay"] > total_net else "mid" if x["pay"] > total_net * 0.5 else "low") if total_net > 0 else \
+                         ("high" if x["pay"] > 0 else "low")
+    return {"campaign": f"{camp['lotto_name']} งวด {camp['draw_date']}", "value": f, "scope": "ทั้งระบบ" if me["role"] == "Admin" else "สายงานของคุณ",
+            "total_amount": total_amt, "total_net": total_net, "worst_top": worst_top, "worst_bot": worst_bot,
+            "worst_total": worst_top + worst_bot, "worst_profit": total_net - worst_top - worst_bot,
+            "tops": tops[:20], "bots": bots[:20], "items": items[:40], "count": len(items),
+            "build": BUILD, "updated": get_thai_time().strftime("%d/%m/%Y %H:%M:%S")}
+
+
+_RISK_HTML = """
+<style>
+.rk-wrap{max-width:1250px;margin:0 auto}
+.rk-card{background:#fff;border:1px solid #dee2e6;border-radius:8px;padding:12px;text-align:center}
+.rk-card h6{color:#6c757d;font-size:.8rem;margin:0}.rk-card .v{font-size:1.4rem;font-weight:800}
+.rk-table th{background:#212529;color:#fff;text-align:center;white-space:nowrap}.rk-table td{text-align:center;font-variant-numeric:tabular-nums}
+.rk-table td.big{font-size:1.15rem;font-weight:800;letter-spacing:1px}
+.rk-high{background:#f8d7da}.rk-mid{background:#fff3cd}.rk-over{outline:3px solid #dc3545;outline-offset:-3px}
+.rk-live{display:inline-block;width:10px;height:10px;border-radius:50%;background:#198754;margin-right:6px;animation:rkp 1.2s infinite}
+@keyframes rkp{50%{opacity:.25}}
+</style>
+<div class="rk-wrap">
+  <div class="d-flex flex-wrap gap-2 align-items-center mb-3">
+    <label class="fw-bold">งวด:</label>
+    <select id="rk-f" class="form-select form-select-sm" style="max-width:340px">
+      {% for o in options %}<option value="{{ o.value }}">{{ o.label }}</option>{% endfor %}
+    </select>
+    <label class="small ms-2">เพดานจ่ายต่อเลข (บาท): <input type="number" id="rk-limit" class="form-control form-control-sm d-inline-block" style="width:130px" min="0" step="1000" placeholder="ไม่กำหนด"></label>
+    <label class="small"><input type="checkbox" id="rk-auto" checked> รีเฟรชทุก 5 วินาที</label>
+    <button class="btn btn-sm btn-outline-primary" id="rk-now" type="button">🔄 รีเฟรช</button>
+    <span class="small text-muted"><span class="rk-live"></span><span id="rk-upd">กำลังโหลด...</span></span>
+  </div>
+  <div id="rk-alert"></div>
+  <div class="row g-2 mb-3" id="rk-cards"></div>
+  <div class="alert alert-info py-1 small">💡 "ยอดจ่ายถ้าเลขออก" คำนวณจากทุกรายการที่ถูกซื้อ (3ตรง/โต๊ด/2บน/2ล่าง/วิ่ง) ด้วยอัตราจ่ายตอนซื้อ และหารครึ่งให้เลขจ่ายครึ่ง · 🔴 = จ่ายมากกว่ายอดสุทธิที่รับมา · 🟠 = เกินครึ่งของยอดสุทธิ · ผลบนและผลล่างออกแยกกัน จึงรวมกรณีเลวร้ายสุดของทั้งสองฝั่ง · {{ scope_note }}</div>
+  <div class="row g-3">
+    <div class="col-lg-4"><h6 class="fw-bold">🎯 เลขบน 3 ตัวที่เสี่ยงสุด</h6><table class="table table-sm table-bordered rk-table bg-white"><thead><tr><th>เลข</th><th>จ่ายถ้าออก</th><th>เทียบยอดสุทธิ</th></tr></thead><tbody id="rk-top"></tbody></table></div>
+    <div class="col-lg-4"><h6 class="fw-bold">🎯 เลขล่าง 2 ตัวที่เสี่ยงสุด</h6><table class="table table-sm table-bordered rk-table bg-white"><thead><tr><th>เลข</th><th>จ่ายถ้าออก</th><th>เทียบยอดสุทธิ</th></tr></thead><tbody id="rk-bot"></tbody></table></div>
+    <div class="col-lg-4"><h6 class="fw-bold">🔥 รายการที่ถูกซื้อมากสุด (แยกประเภท)</h6><table class="table table-sm table-bordered rk-table bg-white"><thead><tr><th>เลข</th><th>ประเภท</th><th>ยอดซื้อ</th><th>จ่ายถ้าถูก</th></tr></thead><tbody id="rk-items"></tbody></table></div>
+  </div>
+</div>
+<script>
+(function(){
+var URL0="{{ data_url }}",sel=document.getElementById('rk-f'),lim=document.getElementById('rk-limit'),busy=false;
+try{lim.value=localStorage.getItem('rk-limit')||'';}catch(e){}
+function nf(v){return Number(v).toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function mk(t,c,x){var n=document.createElement(t);if(c)n.className=c;if(x!==undefined)n.textContent=x;return n;}
+function limit(){var v=parseFloat(lim.value);return isNaN(v)||v<=0?null:v;}
+function icon(l){return l==='high'?'🔴':l==='mid'?'🟠':'🟢';}
+function load(){if(busy)return;busy=true;
+ fetch(URL0+(URL0.indexOf('?')<0?'?':'&')+'f='+encodeURIComponent(sel.value),{credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
+ .then(function(d){busy=false;draw(d);}).catch(function(){busy=false;document.getElementById('rk-upd').textContent='โหลดไม่สำเร็จ (จะลองใหม่)';});}
+function card(t,v,cls){var c=mk('div','col-6 col-md-3'),b=mk('div','rk-card');b.appendChild(mk('h6','',t));b.appendChild(mk('div','v '+(cls||''),v));c.appendChild(b);return c;}
+function rowsFor(tb,list,net,cols){tb.textContent='';var L=limit();
+ list.forEach(function(x){var tr=mk('tr','rk-'+x.level+(L&&x.pay>L?' rk-over':''));
+  cols(x).forEach(function(c,i){var td=mk('td',c.big?'big':'',c.t);tr.appendChild(td);});tb.appendChild(tr);});
+ if(!list.length){var tr=mk('tr'),td=mk('td','text-muted','ยังไม่มีข้อมูล');td.colSpan=4;tr.appendChild(td);tb.appendChild(tr);}}
+function draw(d){
+ if(d.error){document.getElementById('rk-upd').textContent=d.error;return;}
+ if(!sel.value||sel.value!==d.value){sel.value=d.value;}
+ var cards=document.getElementById('rk-cards');cards.textContent='';
+ cards.appendChild(card('ยอดซื้อรวม',nf(d.total_amount)));cards.appendChild(card('ยอดสุทธิที่รับ',nf(d.total_net)));
+ cards.appendChild(card('จ่ายสูงสุดถ้าเลวร้ายสุด',nf(d.worst_total),'text-danger'));
+ cards.appendChild(card('กำไร/ขาดทุน กรณีเลวร้ายสุด',nf(d.worst_profit),d.worst_profit<0?'text-danger':'text-success'));
+ var L=limit(),al=document.getElementById('rk-alert');al.textContent='';
+ var over=d.tops.concat(d.bots).filter(function(x){return L&&x.pay>L;});
+ if(d.worst_profit<0||over.length){var a=mk('div','alert alert-danger fw-bold py-2','⚠️ '+(d.worst_profit<0?'กรณีเลวร้ายสุดจะขาดทุน '+nf(-d.worst_profit)+' บาท ':'')+(over.length?'· มี '+over.length+' เลขที่จ่ายเกินเพดานที่ตั้งไว้ — พิจารณาอั้น/จ่ายครึ่ง':''));al.appendChild(a);}
+ rowsFor(document.getElementById('rk-top'),d.tops,d.total_net,function(x){return [{t:x.num,big:1},{t:nf(x.pay)},{t:icon(x.level)+' '+nf(d.total_net-x.pay)}];});
+ rowsFor(document.getElementById('rk-bot'),d.bots,d.total_net,function(x){return [{t:x.num,big:1},{t:nf(x.pay)},{t:icon(x.level)+' '+nf(d.total_net-x.pay)}];});
+ rowsFor(document.getElementById('rk-items'),d.items,d.total_net,function(x){return [{t:x.num,big:1},{t:x.type+(x.half?' (ครึ่ง)':'')},{t:nf(x.amount)},{t:nf(x.pay)}];});
+ document.getElementById('rk-upd').textContent=d.campaign+' · '+d.scope+' · อัปเดต '+d.updated+' · รุ่น '+d.build;}
+sel.onchange=load;lim.onchange=function(){try{localStorage.setItem('rk-limit',lim.value);}catch(e){}load();};
+document.getElementById('rk-now').onclick=load;
+setInterval(function(){if(document.getElementById('rk-auto').checked&&!document.hidden)load();},5000);load();
+})();
+</script>
+"""
+
+
+def render_risk(c, data_url, scope_note=""):
+    return _Jinja(_RISK_HTML, autoescape=True).render(options=risk_options(c), data_url=data_url, scope_note=scope_note)
