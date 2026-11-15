@@ -1000,8 +1000,12 @@ CUSTOMER_CONTENT = """
                     <input type="hidden" name="customer_id" value="{{ edit_customer[0] }}">
                     <div class="mb-3"><label class="form-label fw-bold">ชื่อลูกค้า:</label><input type="text" name="name" class="form-control" value="{{ edit_customer[1] }}" required></div>
                     <div class="row mb-3">
-                        <div class="col"><label class="form-label small">ส่วนลดรวม(%):</label><input type="number" step="0.01" name="disc_total" class="form-control" value="{{ edit_customer[2] or 0 }}"></div>
+                        <div class="col"><label class="form-label small">ส่วนลด 3ตัว(%):</label><input type="number" step="0.01" name="disc_3d" class="form-control" value="{{ edit_customer[9] or 0 }}"></div>
+                        <div class="col"><label class="form-label small">ส่วนลด 2ตัว(%):</label><input type="number" step="0.01" name="disc_2d" class="form-control" value="{{ edit_customer[10] or 0 }}"></div>
                         <div class="col"><label class="form-label small">ส่วนลดวิ่ง(%):</label><input type="number" step="0.01" name="disc_run" class="form-control" value="{{ edit_customer[8] or 0 }}"></div>
+                    </div>
+                    <div class="row mb-3">
+                        <div class="col"><label class="form-label small">ส่วนลดรวม(%) (ใช้เมื่อช่องแยก = 0):</label><input type="number" step="0.01" name="disc_total" class="form-control" value="{{ edit_customer[2] or 0 }}"></div>
                     </div>
                     <div class="row mb-3">
                         <div class="col"><label class="form-label small">จ่าย 3ตรง:</label><input type="number" step="0.01" name="pay_3d" class="form-control" value="{{ edit_customer[3] or 500 }}"></div>
@@ -1022,8 +1026,12 @@ CUSTOMER_CONTENT = """
                     <input type="hidden" name="draw" value="{{ draw_date }}">
                     <div class="mb-3"><label class="form-label fw-bold">ชื่อลูกค้า:</label><input type="text" name="name" class="form-control" required></div>
                     <div class="row mb-3">
-                        <div class="col"><label class="form-label small">ส่วนลดรวม(%):</label><input type="number" step="0.01" name="disc_total" class="form-control" value="0"></div>
+                        <div class="col"><label class="form-label small">ส่วนลด 3ตัว(%):</label><input type="number" step="0.01" name="disc_3d" class="form-control" value="0"></div>
+                        <div class="col"><label class="form-label small">ส่วนลด 2ตัว(%):</label><input type="number" step="0.01" name="disc_2d" class="form-control" value="0"></div>
                         <div class="col"><label class="form-label small">ส่วนลดวิ่ง(%):</label><input type="number" step="0.01" name="disc_run" class="form-control" value="0"></div>
+                    </div>
+                    <div class="row mb-3">
+                        <div class="col"><label class="form-label small">ส่วนลดรวม(%) (ใช้เมื่อช่องแยก = 0):</label><input type="number" step="0.01" name="disc_total" class="form-control" value="0"></div>
                     </div>
                     <div class="row mb-3">
                         <div class="col"><label class="form-label small">จ่าย 3ตรง:</label><input type="number" step="0.01" name="pay_3d" class="form-control" value="500"></div>
@@ -1045,12 +1053,12 @@ CUSTOMER_CONTENT = """
             <div class="table-responsive">
                 <table class="table table-striped table-bordered text-center align-middle" style="font-size: 0.85rem;">
                     <thead class="table-dark">
-                        <tr><th>ID</th><th>ชื่อ</th><th>จ่าย 3ตรง</th><th>จ่าย 2ตัว</th><th>วิ่งบน</th><th>วิ่งล่าง</th><th>จัดการ</th></tr>
+                        <tr><th>ID</th><th>ชื่อ</th><th>จ่าย 3ตรง</th><th>จ่าย 2ตัว</th><th>วิ่งบน</th><th>วิ่งล่าง</th><th>ลด 3ตัว%</th><th>ลด 2ตัว%</th><th>ลดวิ่ง%</th><th>ลดรวม%</th><th>จัดการ</th></tr>
                     </thead>
                     <tbody>
                         {% for c in customers_list %}
                         <tr>
-                            <td>{{ c[0] }}</td><td><b>{{ c[1] }}</b></td><td>{{ c[3] or 500 }}</td><td>{{ c[5] or 70 }}</td><td class="text-success fw-bold">{{ c[6] or 3 }}</td><td class="text-success fw-bold">{{ c[7] or 4 }}</td>
+                            <td>{{ c[0] }}</td><td><b>{{ c[1] }}</b></td><td>{{ c[3] or 500 }}</td><td>{{ c[5] or 70 }}</td><td class="text-success fw-bold">{{ c[6] or 3 }}</td><td class="text-success fw-bold">{{ c[7] or 4 }}</td><td>{{ c[9] or 0 }}</td><td>{{ c[10] or 0 }}</td><td>{{ c[8] or 0 }}</td><td>{{ c[2] or 0 }}</td>
                             <td><a href="/customers?user={{ username }}&draw={{ draw_date|urlencode }}&edit_id={{ c[0] }}" class="btn btn-warning btn-sm fw-bold">✏️ แก้ไข</a></td>
                         </tr>
                         {% endfor %}
@@ -1079,8 +1087,10 @@ USERS_CONTENT = """
                     </select>
                 </div>
                 <div class="row mb-3">
-                    <div class="col"><label class="form-label small">ส่วนลดรวม(%):</label><input type="number" step="0.01" name="disc_total" class="form-control" value="0"></div>
+                    <div class="col"><label class="form-label small">ส่วนลด 3ตัว(%):</label><input type="number" step="0.01" name="disc_3d" class="form-control" value="0"></div>
+                    <div class="col"><label class="form-label small">ส่วนลด 2ตัว(%):</label><input type="number" step="0.01" name="disc_2d" class="form-control" value="0"></div>
                     <div class="col"><label class="form-label small">ส่วนลดวิ่ง(%):</label><input type="number" step="0.01" name="disc_run" class="form-control" value="0"></div>
+                    <div class="col"><label class="form-label small">ส่วนลดรวม(%):</label><input type="number" step="0.01" name="disc_total" class="form-control" value="0"></div>
                 </div>
                 <div class="row mb-3">
                     <div class="col"><label class="form-label small">จ่าย 3ตรง:</label><input type="number" step="0.01" name="pay_3d" class="form-control" value="500"></div>
@@ -2026,11 +2036,11 @@ def customers_page(user: str, draw: str, msg: str = None, error: str = None, edi
         conn = connect_db(); c = conn.cursor()
         c.execute("SELECT role FROM Users WHERE username=%s", (user,))
         role = c.fetchone()[0]
-        c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run FROM Customers WHERE owner_username=%s", (user,))
+        c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run, disc_3d, disc_2d FROM Customers WHERE owner_username=%s", (user,))
         custs_list = c.fetchall()
         edit_customer = None
         if edit_id:
-            c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run FROM Customers WHERE id=%s AND LOWER(owner_username)=LOWER(%s)", (edit_id, user))
+            c.execute("SELECT id, name, disc_total, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot, disc_run, disc_3d, disc_2d FROM Customers WHERE id=%s AND LOWER(owner_username)=LOWER(%s)", (edit_id, user))
             edit_customer = c.fetchone()
         conn.close()
         draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
@@ -2041,10 +2051,10 @@ def customers_page(user: str, draw: str, msg: str = None, error: str = None, edi
 
 @app.post("/save-customer")
 def save_customer(user: str = Form(...), draw: str = Form(...), name: str = Form(...), disc_total: float = Form(0),
-                  disc_run: float = Form(0), pay_3d: float = Form(500), pay_3tod: float = Form(100), pay_2d: float = Form(70),
+                  disc_3d: float = Form(0), disc_2d: float = Form(0), disc_run: float = Form(0), pay_3d: float = Form(500), pay_3tod: float = Form(100), pay_2d: float = Form(70),
                   pay_run_top: float = Form(3), pay_run_bot: float = Form(4)):
     name = name.strip()[:100]
-    v = common.clean_rates(dict(disc_total=disc_total, disc_run=disc_run, pay_3d=pay_3d, pay_3tod=pay_3tod,
+    v = common.clean_rates(dict(disc_total=disc_total, disc_3d=disc_3d, disc_2d=disc_2d, disc_run=disc_run, pay_3d=pay_3d, pay_3tod=pay_3tod,
                                 pay_2d=pay_2d, pay_run_top=pay_run_top, pay_run_bot=pay_run_bot))
     if not name:
         return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "error": "กรุณาระบุชื่อลูกค้า"}), status_code=303)
@@ -2054,9 +2064,9 @@ def save_customer(user: str = Form(...), draw: str = Form(...), name: str = Form
         if over:
             conn.close()
             return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "error": over}), status_code=303)
-        c.execute("INSERT INTO Customers (name, owner_username, discount_type, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot) "
-                  "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                  (name, user, 1, v["disc_total"], v["disc_run"], v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"]))
+        c.execute("INSERT INTO Customers (name, owner_username, discount_type, disc_total, disc_3d, disc_2d, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot) "
+                  "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                  (name, user, 1, v["disc_total"], v["disc_3d"], v["disc_2d"], v["disc_run"], v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"]))
         conn.commit(); conn.close()
         return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "msg": "เพิ่มลูกค้าสำเร็จ"}), status_code=303)
     except Exception as e:
@@ -2064,10 +2074,11 @@ def save_customer(user: str = Form(...), draw: str = Form(...), name: str = Form
 
 @app.post("/update-customer")
 def update_customer(user: str = Form(...), draw: str = Form(...), customer_id: int = Form(...), name: str = Form(...),
-                    disc_total: float = Form(0), disc_run: float = Form(0), pay_3d: float = Form(500),
+                    disc_total: float = Form(0), disc_3d: float = Form(0), disc_2d: float = Form(0),
+                    disc_run: float = Form(0), pay_3d: float = Form(500),
                     pay_3tod: float = Form(100), pay_2d: float = Form(70), pay_run_top: float = Form(3), pay_run_bot: float = Form(4)):
     name = name.strip()[:100]
-    v = common.clean_rates(dict(disc_total=disc_total, disc_run=disc_run, pay_3d=pay_3d, pay_3tod=pay_3tod,
+    v = common.clean_rates(dict(disc_total=disc_total, disc_3d=disc_3d, disc_2d=disc_2d, disc_run=disc_run, pay_3d=pay_3d, pay_3tod=pay_3tod,
                                 pay_2d=pay_2d, pay_run_top=pay_run_top, pay_run_bot=pay_run_bot))
     conn = connect_db()
     try:
@@ -2078,9 +2089,9 @@ def update_customer(user: str = Form(...), draw: str = Form(...), customer_id: i
         over = common.check_rates_within(c, me, v)
         if over:
             return RedirectResponse(url="/customers?" + urlencode({"user": user, "draw": draw, "edit_id": customer_id, "error": over}), status_code=303)
-        c.execute("UPDATE Customers SET name=%s, disc_total=%s, disc_run=%s, pay_3d=%s, pay_3tod=%s, pay_2d=%s, pay_run_top=%s, pay_run_bot=%s "
+        c.execute("UPDATE Customers SET name=%s, disc_total=%s, disc_3d=%s, disc_2d=%s, disc_run=%s, pay_3d=%s, pay_3tod=%s, pay_2d=%s, pay_run_top=%s, pay_run_bot=%s "
                   "WHERE id=%s AND LOWER(owner_username)=LOWER(%s)",
-                  (name, v["disc_total"], v["disc_run"], v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"],
+                  (name, v["disc_total"], v["disc_3d"], v["disc_2d"], v["disc_run"], v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"],
                    customer_id, user))
         if c.rowcount == 0:
             conn.rollback()
@@ -2110,12 +2121,12 @@ def users_page(user: str, draw: str, msg: str = None, error: str = None):
 
 @app.post("/save-user-level")
 def save_user_level(user: str = Form(...), draw: str = Form(...), new_username: str = Form(...), new_password: str = Form(...),
-                    new_role: str = Form(...), disc_total: float = Form(0), disc_run: float = Form(0), pay_3d: float = Form(500),
+                    new_role: str = Form(...), disc_total: float = Form(0), disc_3d: float = Form(0), disc_2d: float = Form(0), disc_run: float = Form(0), pay_3d: float = Form(500),
                     pay_3tod: float = Form(100), pay_2d: float = Form(70), pay_run_top: float = Form(3), pay_run_bot: float = Form(4)):
     def back(**kw):
         return RedirectResponse(url="/users?" + urlencode({"user": user, "draw": draw, **kw}), status_code=303)
     new_username = new_username.strip()
-    v = common.clean_rates(dict(disc_total=disc_total, disc_run=disc_run, pay_3d=pay_3d, pay_3tod=pay_3tod,
+    v = common.clean_rates(dict(disc_total=disc_total, disc_3d=disc_3d, disc_2d=disc_2d, disc_run=disc_run, pay_3d=pay_3d, pay_3tod=pay_3tod,
                                 pay_2d=pay_2d, pay_run_top=pay_run_top, pay_run_bot=pay_run_bot))
     conn = connect_db()
     try:
@@ -2134,9 +2145,9 @@ def save_user_level(user: str = Form(...), draw: str = Form(...), new_username: 
         c.execute("SELECT 1 FROM Users WHERE LOWER(username)=LOWER(%s)", (new_username,))
         if c.fetchone():
             return back(error="มี Username นี้อยู่แล้ว")
-        c.execute("INSERT INTO Users (username, password, role, parent_user, disc_total, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot) "
-                  "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                  (new_username, common.store_password(new_password), new_role, user, v["disc_total"], v["disc_run"],
+        c.execute("INSERT INTO Users (username, password, role, parent_user, disc_total, disc_3d, disc_2d, disc_run, pay_3d, pay_3tod, pay_2d, pay_run_top, pay_run_bot) "
+                  "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                  (new_username, common.store_password(new_password), new_role, user, v["disc_total"], v["disc_3d"], v["disc_2d"], v["disc_run"],
                    v["pay_3d"], v["pay_3tod"], v["pay_2d"], v["pay_run_top"], v["pay_run_bot"]))
         conn.commit()
     except Exception as e:
