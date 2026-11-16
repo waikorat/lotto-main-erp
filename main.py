@@ -658,6 +658,7 @@ BLOCKED_TEMPLATE = """
 BUY_CONTENT = """
 <div class="row">
     <div class="col-lg-8">
+        <div class="mb-2 text-end"><a class="btn btn-outline-danger btn-sm fw-bold" href="/cancel-bills?user={{ username }}&draw={{ draw_date|urlencode }}">🗑️ ยกเลิกบิล</a></div>
         <div class="card shadow p-4 mb-4">
             <form id="custForm" method="GET" action="/buy">
                 <input type="hidden" name="user" value="{{ username }}">
@@ -1979,35 +1980,26 @@ def dashboard_page(user: str, draw: str, start_date: str = None, end_date: str =
     except Exception as e:
         return f"Dashboard Error: {str(e)}"
 
-@app.get("/audit-all", response_class=HTMLResponse)
-def audit_all_page(user: str, draw: str):
+def _audit_view(user, draw, camp, buyer, num, path, title, admin_only):
     try:
-        conn = connect_db(); c = conn.cursor()
-        c.execute("SELECT role FROM Users WHERE username=%s", (user,))
-        role = c.fetchone()[0]
-        if role != 'Admin': return RedirectResponse(url=f"/buy?user={_q(user)}&draw={_q(draw)}", status_code=status.HTTP_303_SEE_OTHER)
-        draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
-        c.execute("SELECT * FROM Transactions WHERE (draw_date = %s OR draw_date ILIKE %s) ORDER BY id DESC", (draw_clean, f"%{draw_clean}%"))
-        audit_rows = c.fetchall(); conn.close()
-        close_t = get_current_campaign_close_time(draw_clean)
-        content = Template(AUDIT_ALL_CONTENT).render(audit_rows=audit_rows)
-        return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, current_close_time=close_t)
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            if admin_only and me["role"] != "Admin":
+                return RedirectResponse(url=f"/buy?user={_q(user)}&draw={_q(draw)}", status_code=status.HTTP_303_SEE_OTHER)
+            content = common.render_audit(c, me, path, {"user": user, "draw": draw}, title, camp=camp, buyer=buyer, num=num, draw=draw)
+        return Template(LAYOUT).render(username=user, role=me["role"], draw_date=draw, content=content, current_close_time=None)
     except Exception as e: return route_error(e)
 
+@app.get("/audit-all", response_class=HTMLResponse)
+def audit_all_page(user: str, draw: str = "", camp: str = "", buyer: str = "", num: str = ""):
+    return _audit_view(user, draw, camp, buyer, num, "/audit-all", "🔍 ตรวจสอบรายการซื้อทั้งหมด", True)
+
 @app.get("/audit-discount", response_class=HTMLResponse)
-def audit_discount_page(user: str, draw: str):
-    try:
-        conn = connect_db(); c = conn.cursor()
-        c.execute("SELECT role FROM Users WHERE username=%s", (user,))
-        role = c.fetchone()[0]
-        draw_clean = draw.split("งวด ")[1].strip() if "งวด " in draw else draw
-        if role == 'Admin': c.execute("SELECT * FROM Transactions WHERE (draw_date = %s OR draw_date ILIKE %s) ORDER BY id DESC", (draw_clean, f"%{draw_clean}%"))
-        else: c.execute("SELECT * FROM Transactions WHERE ((draw_date = %s OR draw_date ILIKE %s) AND username = ANY(%s)) ORDER BY id DESC", (draw_clean, f"%{draw_clean}%", common.get_subtree(c, user)))
-        discount_rows = c.fetchall(); conn.close()
-        close_t = get_current_campaign_close_time(draw_clean)
-        content = Template(AUDIT_DISCOUNT_CONTENT).render(discount_rows=discount_rows)
-        return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, current_close_time=close_t)
-    except Exception as e: return route_error(e)
+def audit_discount_page(user: str, draw: str = "", camp: str = "", buyer: str = "", num: str = ""):
+    return _audit_view(user, draw, camp, buyer, num, "/audit-discount", "🔍 ตรวจสอบส่วนลดลูกค้า / รายการซื้อ", False)
 
 @app.get("/db-inspector", response_class=HTMLResponse)
 def db_inspector_page(user: str, draw: str, table_name: str = None):
@@ -2376,18 +2368,50 @@ def risk_control_page(user: str, draw: str = "ควบคุมความเ�
 
 
 @app.get("/risk-data")
-def risk_data_api(user: str, f: str = ""):
+def risk_data_api(user: str, f: str = "", all: int = 0):
     try:
         with common.db() as conn:
             c = conn.cursor()
             me = common.get_user(c, user)
             if not me:
                 return JSONResponse({"error": "forbidden"}, status_code=403)
-            data = common.risk_data(c, me["username"], f)
+            data = common.risk_data(c, me["username"], f, bool(all))
         return JSONResponse(data)
     except Exception as e:
         print("risk_data error:", e)
         return JSONResponse({"error": "server"}, status_code=500)
+
+
+@app.get("/cancel-bills", response_class=HTMLResponse)
+def cancel_bills_page(user: str, draw: str, msg: str = None, error: str = None):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            ln, dc = split_draw(draw)
+            camp = common._camp_of_tx(c, dc or draw, ln)
+            if not camp:
+                return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "error": "ไม่พบงวดหวยนี้"}), status_code=303)
+            inner = common.render_cancel_bills(c, me, camp, "/cancel-bill", {"user": user, "draw": draw})
+        back = Template("<div class='mb-2'><a class='btn btn-primary btn-sm fw-bold' href='/buy?user={{ u|urlencode }}&draw={{ d|urlencode }}'>⬅️ กลับหน้าบันทึกโพย</a></div>{{ inner|safe }}").render(u=user, d=draw, inner=inner)
+        return Template(LAYOUT).render(username=user, role=me["role"], draw_date=draw, content=back, msg=msg, error=error, current_close_time=None)
+    except Exception as e: return route_error(e)
+
+
+@app.post("/cancel-bill")
+def cancel_bill_post(user: str = Form(...), draw: str = Form(...), bill_no: str = Form(...), reason: str = Form("")):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            ok, text = common.cancel_bill(c, me, bill_no, reason)
+        q = {"user": user, "draw": draw, ("msg" if ok else "error"): text}
+        return RedirectResponse(url="/cancel-bills?" + urlencode(q), status_code=303)
+    except Exception as e: return route_error(e)
 
 
 @app.get("/logout")

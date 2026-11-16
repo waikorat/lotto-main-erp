@@ -986,6 +986,10 @@ MIGRATIONS = [
     "type TEXT, amount NUMERIC DEFAULT 0, status TEXT, discount NUMERIC DEFAULT 0, net NUMERIC DEFAULT 0, "
     "payout_rate NUMERIC DEFAULT 0, lotto_name TEXT)",
     "CREATE TABLE IF NOT EXISTS DrawResults (id SERIAL PRIMARY KEY, draw_date TEXT UNIQUE, prize_1 TEXT, bottom_2 TEXT)",
+    "CREATE TABLE IF NOT EXISTS CancelledTransactions (id SERIAL PRIMARY KEY, orig_id INTEGER, draw_date TEXT, timestamp TEXT, "
+    "username TEXT, customer_id INTEGER, customer_name TEXT, customer_type TEXT, bill_no TEXT, num TEXT, type TEXT, "
+    "amount NUMERIC DEFAULT 0, status TEXT, discount NUMERIC DEFAULT 0, net NUMERIC DEFAULT 0, payout_rate NUMERIC DEFAULT 0, "
+    "lotto_name TEXT, cancelled_by TEXT, cancelled_at TEXT, reason TEXT)",
     "CREATE TABLE IF NOT EXISTS AgentSettlements (id SERIAL PRIMARY KEY, agent_username VARCHAR(100), "
     "target_name VARCHAR(100), amount NUMERIC(12,2), settle_type VARCHAR(20), note TEXT, timestamp TEXT)",
     # เรตแยกหวย: คีย์มาตรฐานคือ target_id ("12" = ลูกค้า, "user_5" = ผู้ใช้); เก็บ customer_id ไว้ให้ระบบหลักเดิมยังทำงานได้
@@ -1096,7 +1100,7 @@ def risk_options(c):
             for r in c.fetchall()]
 
 
-def risk_data(c, root, f=""):
+def risk_data(c, root, f="", show_all=False):
     """วิเคราะห์ความเสี่ยงของงวดหนึ่ง: ถ้าเลขนั้นออก จะต้องจ่ายเท่าไร เทียบกับยอดสุทธิที่รับมา
     ขอบเขต: แอดมินเห็นทั้งระบบ / ผู้ใช้อื่นเห็นเฉพาะยอดของตัวเองและสายงานใต้ตัวเอง
     หมายเหตุ: ผลบน (3 หลัก) และผลล่าง (2 หลัก) ออกแยกกัน จึงรวมกรณีเลวร้ายสุดของสองฝั่ง"""
@@ -1119,7 +1123,10 @@ def risk_data(c, root, f=""):
     half = {n for n, st in get_blocked_map(c, camp["lotto_name"], camp["draw_date"]).items() if st == "จ่ายครึ่ง"}
 
     items, total_amt, total_net = [], 0.0, 0.0
-    p3, tod, tod_tot, p2t, p2b, rt, rb = {}, {}, {}, {}, {}, {}, {}
+    # pay = ยอดจ่ายถ้าถูก, amt = ยอดซื้อ  (แยกตามประเภท)
+    P = {t: {} for t in ("3ตัวตรง", "2ตัวบน", "2ตัวล่าง", "วิ่งบน", "วิ่งล่าง")}
+    A = {t: {} for t in P}
+    tod_p, tod_a, tod_pt, tod_at = {}, {}, {}, {}
     for num, t, amt, pay, net in rows:
         n, t = str(num).strip(), str(t).strip()
         amt, pay, net = float(amt), float(pay), float(net)
@@ -1129,40 +1136,41 @@ def risk_data(c, root, f=""):
         total_amt += amt
         total_net += net
         items.append({"num": n, "type": t, "amount": amt, "pay": pay, "half": is_half})
-        if t == "3ตัวตรง":
-            p3[n] = p3.get(n, 0) + pay
-        elif t == "3ตัวโต๊ด":
+        if t == "3ตัวโต๊ด":
             k = "".join(sorted(n))
-            tod.setdefault(k, {})[n] = tod.setdefault(k, {}).get(n, 0) + pay
-            tod_tot[k] = tod_tot.get(k, 0) + pay
-        elif t == "2ตัวบน":
-            p2t[n] = p2t.get(n, 0) + pay
-        elif t == "2ตัวล่าง":
-            p2b[n] = p2b.get(n, 0) + pay
-        elif t == "วิ่งบน":
-            rt[n] = rt.get(n, 0) + pay
-        elif t == "วิ่งล่าง":
-            rb[n] = rb.get(n, 0) + pay
+            tod_p.setdefault(k, {})[n] = tod_p.setdefault(k, {}).get(n, 0) + pay
+            tod_a.setdefault(k, {})[n] = tod_a.setdefault(k, {}).get(n, 0) + amt
+            tod_pt[k] = tod_pt.get(k, 0) + pay
+            tod_at[k] = tod_at.get(k, 0) + amt
+        elif t in P:
+            P[t][n] = P[t].get(n, 0) + pay
+            A[t][n] = A[t].get(n, 0) + amt
 
     tops = []
     for i in range(1000):
         r = f"{i:03d}"
         k = "".join(sorted(r))
-        pay = (p3.get(r, 0) + tod_tot.get(k, 0) - tod.get(k, {}).get(r, 0) + p2t.get(r[-2:], 0)
-               + sum(rt.get(d, 0) for d in set(r)))
-        if pay > 0:
-            tops.append({"num": r, "pay": pay})
+        ds = set(r)
+        s3, p3 = A["3ตัวตรง"].get(r, 0), P["3ตัวตรง"].get(r, 0)
+        stod, ptod = tod_at.get(k, 0) - tod_a.get(k, {}).get(r, 0), tod_pt.get(k, 0) - tod_p.get(k, {}).get(r, 0)
+        s2, p2 = A["2ตัวบน"].get(r[-2:], 0), P["2ตัวบน"].get(r[-2:], 0)
+        srun, prun = sum(A["วิ่งบน"].get(d, 0) for d in ds), sum(P["วิ่งบน"].get(d, 0) for d in ds)
+        pay = p3 + ptod + p2 + prun
+        stake = s3 + stod + s2 + srun
+        if pay > 0 or stake > 0 or show_all:
+            tops.append({"num": r, "s3": s3, "stod": stod, "s2": s2, "srun": srun, "stake": stake, "pay": pay})
     bots = []
     for i in range(100):
         r = f"{i:02d}"
-        pay = p2b.get(r, 0) + sum(rb.get(d, 0) for d in set(r))
-        if pay > 0:
-            bots.append({"num": r, "pay": pay})
-    tops.sort(key=lambda x: -x["pay"])
-    bots.sort(key=lambda x: -x["pay"])
-    worst_top = tops[0]["pay"] if tops else 0.0
-    worst_bot = bots[0]["pay"] if bots else 0.0
-    items.sort(key=lambda x: (-x["pay"], -x["amount"]))
+        ds = set(r)
+        s2, p2 = A["2ตัวล่าง"].get(r, 0), P["2ตัวล่าง"].get(r, 0)
+        srun, prun = sum(A["วิ่งล่าง"].get(d, 0) for d in ds), sum(P["วิ่งล่าง"].get(d, 0) for d in ds)
+        pay, stake = p2 + prun, s2 + srun
+        if pay > 0 or stake > 0 or show_all:
+            bots.append({"num": r, "s2": s2, "srun": srun, "stake": stake, "pay": pay})
+    worst_top = max((x["pay"] for x in tops), default=0.0)
+    worst_bot = max((x["pay"] for x in bots), default=0.0)
+    items.sort(key=lambda x: (x["num"], x["type"]))
     for lst in (tops, bots, items):
         for x in lst:
             x["level"] = ("high" if x["pay"] > total_net else "mid" if x["pay"] > total_net * 0.5 else "low") if total_net > 0 else \
@@ -1170,72 +1178,97 @@ def risk_data(c, root, f=""):
     return {"campaign": f"{camp['lotto_name']} งวด {camp['draw_date']}", "value": f, "scope": "ทั้งระบบ" if me["role"] == "Admin" else "สายงานของคุณ",
             "total_amount": total_amt, "total_net": total_net, "worst_top": worst_top, "worst_bot": worst_bot,
             "worst_total": worst_top + worst_bot, "worst_profit": total_net - worst_top - worst_bot,
-            "tops": tops[:20], "bots": bots[:20], "items": items[:40], "count": len(items),
+            "tops": tops, "bots": bots, "items": items[:3000], "count": len(items),
             "build": BUILD, "updated": get_thai_time().strftime("%d/%m/%Y %H:%M:%S")}
 
 
 _RISK_HTML = """
 <style>
-.rk-wrap{max-width:1250px;margin:0 auto}
+.rk-wrap{max-width:1300px;margin:0 auto}
 .rk-card{background:#fff;border:1px solid #dee2e6;border-radius:8px;padding:12px;text-align:center}
 .rk-card h6{color:#6c757d;font-size:.8rem;margin:0}.rk-card .v{font-size:1.4rem;font-weight:800}
-.rk-table th{background:#212529;color:#fff;text-align:center;white-space:nowrap}.rk-table td{text-align:center;font-variant-numeric:tabular-nums}
-.rk-table td.big{font-size:1.15rem;font-weight:800;letter-spacing:1px}
+.rk-table th{background:#212529;color:#fff;text-align:center;white-space:nowrap;position:sticky;top:0}.rk-table td{text-align:center;font-variant-numeric:tabular-nums}
+.rk-table td.big{font-size:1.1rem;font-weight:800;letter-spacing:1px}
+.rk-scroll{max-height:560px;overflow:auto;border:1px solid #dee2e6}
 .rk-high{background:#f8d7da}.rk-mid{background:#fff3cd}.rk-over{outline:3px solid #dc3545;outline-offset:-3px}
 .rk-live{display:inline-block;width:10px;height:10px;border-radius:50%;background:#198754;margin-right:6px;animation:rkp 1.2s infinite}
 @keyframes rkp{50%{opacity:.25}}
 </style>
 <div class="rk-wrap">
-  <div class="d-flex flex-wrap gap-2 align-items-center mb-3">
+  <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
     <label class="fw-bold">งวด:</label>
-    <select id="rk-f" class="form-select form-select-sm" style="max-width:340px">
+    <select id="rk-f" class="form-select form-select-sm" style="max-width:320px">
       {% for o in options %}<option value="{{ o.value }}">{{ o.label }}</option>{% endfor %}
     </select>
-    <label class="small ms-2">เพดานจ่ายต่อเลข (บาท): <input type="number" id="rk-limit" class="form-control form-control-sm d-inline-block" style="width:130px" min="0" step="1000" placeholder="ไม่กำหนด"></label>
+    <label class="fw-bold ms-2">เรียงตาม:</label>
+    <select id="rk-sort" class="form-select form-select-sm" style="max-width:240px">
+      <option value="num">ลำดับเลข (น้อย → มาก)</option>
+      <option value="stake">ยอดซื้อ (มาก → น้อย)</option>
+      <option value="pay">จ่ายถ้าออก (มาก → น้อย)</option>
+    </select>
+    <label class="small ms-2">เพดานจ่ายต่อเลข (บาท): <input type="number" id="rk-limit" class="form-control form-control-sm d-inline-block" style="width:120px" min="0" step="1000" placeholder="ไม่กำหนด"></label>
+  </div>
+  <div class="d-flex flex-wrap gap-3 align-items-center mb-3">
+    <label class="small"><input type="checkbox" id="rk-all"> แสดงเลขที่ยังไม่มียอดด้วย</label>
     <label class="small"><input type="checkbox" id="rk-auto" checked> รีเฟรชทุก 5 วินาที</label>
     <button class="btn btn-sm btn-outline-primary" id="rk-now" type="button">🔄 รีเฟรช</button>
     <span class="small text-muted"><span class="rk-live"></span><span id="rk-upd">กำลังโหลด...</span></span>
   </div>
   <div id="rk-alert"></div>
   <div class="row g-2 mb-3" id="rk-cards"></div>
-  <div class="alert alert-info py-1 small">💡 "ยอดจ่ายถ้าเลขออก" คำนวณจากทุกรายการที่ถูกซื้อ (3ตรง/โต๊ด/2บน/2ล่าง/วิ่ง) ด้วยอัตราจ่ายตอนซื้อ และหารครึ่งให้เลขจ่ายครึ่ง · 🔴 = จ่ายมากกว่ายอดสุทธิที่รับมา · 🟠 = เกินครึ่งของยอดสุทธิ · ผลบนและผลล่างออกแยกกัน จึงรวมกรณีเลวร้ายสุดของทั้งสองฝั่ง · {{ scope_note }}</div>
-  <div class="row g-3">
-    <div class="col-lg-4"><h6 class="fw-bold">🎯 เลขบน 3 ตัวที่เสี่ยงสุด</h6><table class="table table-sm table-bordered rk-table bg-white"><thead><tr><th>เลข</th><th>จ่ายถ้าออก</th><th>เทียบยอดสุทธิ</th></tr></thead><tbody id="rk-top"></tbody></table></div>
-    <div class="col-lg-4"><h6 class="fw-bold">🎯 เลขล่าง 2 ตัวที่เสี่ยงสุด</h6><table class="table table-sm table-bordered rk-table bg-white"><thead><tr><th>เลข</th><th>จ่ายถ้าออก</th><th>เทียบยอดสุทธิ</th></tr></thead><tbody id="rk-bot"></tbody></table></div>
-    <div class="col-lg-4"><h6 class="fw-bold">🔥 รายการที่ถูกซื้อมากสุด (แยกประเภท)</h6><table class="table table-sm table-bordered rk-table bg-white"><thead><tr><th>เลข</th><th>ประเภท</th><th>ยอดซื้อ</th><th>จ่ายถ้าถูก</th></tr></thead><tbody id="rk-items"></tbody></table></div>
+  <div class="alert alert-info py-1 small">💡 "ยอดซื้อ" = เงินของรายการที่จะถูกรางวัลถ้าเลขนั้นออก · "จ่ายถ้าออก" ใช้อัตราจ่ายตอนซื้อ (เลขจ่ายครึ่งหารสอง) · 🔴 จ่ายมากกว่ายอดสุทธิที่รับ · 🟠 เกินครึ่งของยอดสุทธิ · ผลบนและผลล่างออกแยกกัน · {{ scope_note }}</div>
+  <ul class="nav nav-tabs mb-2" id="rk-tabs">
+    <li class="nav-item"><button class="nav-link active" type="button" data-t="top">🎯 เลขบน 3 ตัว</button></li>
+    <li class="nav-item"><button class="nav-link" type="button" data-t="bot">🎯 เลขล่าง 2 ตัว</button></li>
+    <li class="nav-item"><button class="nav-link" type="button" data-t="items">🔥 แยกประเภทการซื้อ</button></li>
+  </ul>
+  <div class="rk-scroll bg-white">
+  <table class="table table-sm table-bordered rk-table mb-0"><thead id="rk-head"></thead><tbody id="rk-body"></tbody></table>
   </div>
 </div>
 <script>
 (function(){
-var URL0="{{ data_url }}",sel=document.getElementById('rk-f'),lim=document.getElementById('rk-limit'),busy=false;
-try{lim.value=localStorage.getItem('rk-limit')||'';}catch(e){}
+var URL0="{{ data_url }}",sel=document.getElementById('rk-f'),lim=document.getElementById('rk-limit'),srt=document.getElementById('rk-sort'),busy=false,tab='top',D=null;
+try{lim.value=localStorage.getItem('rk-limit')||'';var sv=localStorage.getItem('rk-sort');if(sv)srt.value=sv;}catch(e){}
 function nf(v){return Number(v).toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});}
 function mk(t,c,x){var n=document.createElement(t);if(c)n.className=c;if(x!==undefined)n.textContent=x;return n;}
 function limit(){var v=parseFloat(lim.value);return isNaN(v)||v<=0?null:v;}
 function icon(l){return l==='high'?'🔴':l==='mid'?'🟠':'🟢';}
 function load(){if(busy)return;busy=true;
- fetch(URL0+(URL0.indexOf('?')<0?'?':'&')+'f='+encodeURIComponent(sel.value),{credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
- .then(function(d){busy=false;draw(d);}).catch(function(){busy=false;document.getElementById('rk-upd').textContent='โหลดไม่สำเร็จ (จะลองใหม่)';});}
+ fetch(URL0+(URL0.indexOf('?')<0?'?':'&')+'f='+encodeURIComponent(sel.value)+'&all='+(document.getElementById('rk-all').checked?1:0),{credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
+ .then(function(d){busy=false;D=d;draw();}).catch(function(){busy=false;document.getElementById('rk-upd').textContent='โหลดไม่สำเร็จ (จะลองใหม่)';});}
 function card(t,v,cls){var c=mk('div','col-6 col-md-3'),b=mk('div','rk-card');b.appendChild(mk('h6','',t));b.appendChild(mk('div','v '+(cls||''),v));c.appendChild(b);return c;}
-function rowsFor(tb,list,net,cols){tb.textContent='';var L=limit();
- list.forEach(function(x){var tr=mk('tr','rk-'+x.level+(L&&x.pay>L?' rk-over':''));
-  cols(x).forEach(function(c,i){var td=mk('td',c.big?'big':'',c.t);tr.appendChild(td);});tb.appendChild(tr);});
- if(!list.length){var tr=mk('tr'),td=mk('td','text-muted','ยังไม่มีข้อมูล');td.colSpan=4;tr.appendChild(td);tb.appendChild(tr);}}
-function draw(d){
+var COLS={top:[['เลข','num'],['3ตรง','s3'],['โต๊ด','stod'],['2บน','s2'],['วิ่งบน','srun'],['ยอดซื้อรวม','stake'],['จ่ายถ้าออก','pay'],['เทียบยอดสุทธิ','cmp']],
+ bot:[['เลข','num'],['2ล่าง','s2'],['วิ่งล่าง','srun'],['ยอดซื้อรวม','stake'],['จ่ายถ้าออก','pay'],['เทียบยอดสุทธิ','cmp']],
+ items:[['เลข','num'],['ประเภท','type'],['ยอดซื้อ','amount'],['จ่ายถ้าถูก','pay'],['เทียบยอดสุทธิ','cmp']]};
+function sorted(list){var k=srt.value,a=list.slice();
+ if(k==='num')a.sort(function(x,y){return x.num<y.num?-1:x.num>y.num?1:(x.type||'')<(y.type||'')?-1:1;});
+ else{var f=(tab==='items')?(k==='stake'?'amount':'pay'):k;a.sort(function(x,y){return (y[f]-x[f])||(x.num<y.num?-1:1);});}
+ return a;}
+function draw(){var d=D;if(!d)return;
  if(d.error){document.getElementById('rk-upd').textContent=d.error;return;}
- if(!sel.value||sel.value!==d.value){sel.value=d.value;}
+ if(sel.value!==d.value){sel.value=d.value;}
  var cards=document.getElementById('rk-cards');cards.textContent='';
  cards.appendChild(card('ยอดซื้อรวม',nf(d.total_amount)));cards.appendChild(card('ยอดสุทธิที่รับ',nf(d.total_net)));
  cards.appendChild(card('จ่ายสูงสุดถ้าเลวร้ายสุด',nf(d.worst_total),'text-danger'));
  cards.appendChild(card('กำไร/ขาดทุน กรณีเลวร้ายสุด',nf(d.worst_profit),d.worst_profit<0?'text-danger':'text-success'));
  var L=limit(),al=document.getElementById('rk-alert');al.textContent='';
  var over=d.tops.concat(d.bots).filter(function(x){return L&&x.pay>L;});
- if(d.worst_profit<0||over.length){var a=mk('div','alert alert-danger fw-bold py-2','⚠️ '+(d.worst_profit<0?'กรณีเลวร้ายสุดจะขาดทุน '+nf(-d.worst_profit)+' บาท ':'')+(over.length?'· มี '+over.length+' เลขที่จ่ายเกินเพดานที่ตั้งไว้ — พิจารณาอั้น/จ่ายครึ่ง':''));al.appendChild(a);}
- rowsFor(document.getElementById('rk-top'),d.tops,d.total_net,function(x){return [{t:x.num,big:1},{t:nf(x.pay)},{t:icon(x.level)+' '+nf(d.total_net-x.pay)}];});
- rowsFor(document.getElementById('rk-bot'),d.bots,d.total_net,function(x){return [{t:x.num,big:1},{t:nf(x.pay)},{t:icon(x.level)+' '+nf(d.total_net-x.pay)}];});
- rowsFor(document.getElementById('rk-items'),d.items,d.total_net,function(x){return [{t:x.num,big:1},{t:x.type+(x.half?' (ครึ่ง)':'')},{t:nf(x.amount)},{t:nf(x.pay)}];});
- document.getElementById('rk-upd').textContent=d.campaign+' · '+d.scope+' · อัปเดต '+d.updated+' · รุ่น '+d.build;}
-sel.onchange=load;lim.onchange=function(){try{localStorage.setItem('rk-limit',lim.value);}catch(e){}load();};
+ if(d.worst_profit<0||over.length){al.appendChild(mk('div','alert alert-danger fw-bold py-2','⚠️ '+(d.worst_profit<0?'กรณีเลวร้ายสุดจะขาดทุน '+nf(-d.worst_profit)+' บาท ':'')+(over.length?'· มี '+over.length+' เลขที่จ่ายเกินเพดานที่ตั้งไว้ — พิจารณาอั้น/จ่ายครึ่ง':'')));}
+ var cols=COLS[tab],head=document.getElementById('rk-head'),body=document.getElementById('rk-body');
+ head.textContent='';var hr=mk('tr');cols.forEach(function(c){hr.appendChild(mk('th','',c[0]));});head.appendChild(hr);
+ body.textContent='';var list=sorted(tab==='top'?d.tops:tab==='bot'?d.bots:d.items);
+ list.forEach(function(x){var tr=mk('tr','rk-'+x.level+(L&&x.pay>L?' rk-over':''));
+  cols.forEach(function(c){var k=c[1],td;
+   if(k==='num')td=mk('td','big',x.num);else if(k==='type')td=mk('td','',x.type+(x.half?' (ครึ่ง)':''));
+   else if(k==='cmp')td=mk('td','',icon(x.level)+' '+nf(d.total_net-x.pay));
+   else td=mk('td','',x[k]?nf(x[k]):'-');
+   tr.appendChild(td);});body.appendChild(tr);});
+ if(!list.length){var tr=mk('tr'),td=mk('td','text-muted py-3','ยังไม่มีข้อมูล');td.colSpan=cols.length;tr.appendChild(td);body.appendChild(tr);}
+ document.getElementById('rk-upd').textContent=d.campaign+' · '+d.scope+' · '+list.length+' รายการ · อัปเดต '+d.updated+' · รุ่น '+d.build;}
+document.querySelectorAll('#rk-tabs button').forEach(function(b){b.onclick=function(){tab=b.getAttribute('data-t');document.querySelectorAll('#rk-tabs button').forEach(function(x){x.classList.toggle('active',x===b);});draw();};});
+srt.onchange=function(){try{localStorage.setItem('rk-sort',srt.value);}catch(e){}draw();};
+sel.onchange=load;document.getElementById('rk-all').onchange=load;lim.onchange=function(){try{localStorage.setItem('rk-limit',lim.value);}catch(e){}draw();};
 document.getElementById('rk-now').onclick=load;
 setInterval(function(){if(document.getElementById('rk-auto').checked&&!document.hidden)load();},5000);load();
 })();
@@ -1245,3 +1278,229 @@ setInterval(function(){if(document.getElementById('rk-auto').checked&&!document.
 
 def render_risk(c, data_url, scope_note=""):
     return _Jinja(_RISK_HTML, autoescape=True).render(options=risk_options(c), data_url=data_url, scope_note=scope_note)
+
+
+# ============================================================ ตรวจสอบรายการซื้อ (กรองตามงวด / ผู้ซื้อ / เลข)
+
+def audit_options(c, me):
+    """ตัวเลือกงวดและผู้ซื้อ (ลูกค้า + ผู้ใช้ใต้สายงาน) ตามขอบเขตของผู้ดู"""
+    camps = [{"value": o["value"][2:], "label": o["label"]} for o in risk_options(c)]
+    if me["role"] == "Admin":
+        c.execute("SELECT id, name FROM Customers ORDER BY name LIMIT 1000")
+        cust = c.fetchall()
+        c.execute("SELECT id, username FROM Users ORDER BY username LIMIT 1000")
+        users = c.fetchall()
+    else:
+        sub = get_subtree(c, me["username"])
+        c.execute("SELECT id, name FROM Customers WHERE owner_username = ANY(%s) ORDER BY name LIMIT 1000", (sub,))
+        cust = c.fetchall()
+        c.execute("SELECT id, username FROM Users WHERE username = ANY(%s) ORDER BY username LIMIT 1000", (sub,))
+        users = c.fetchall()
+    buyers = [{"value": f"Customer:{i}", "label": f"👤 ลูกค้า: {n}"} for i, n in cust] + \
+             [{"value": f"User:{i}", "label": f"🧑‍💼 ผู้ใช้/สายงาน: {n}"} for i, n in users]
+    return camps, buyers
+
+
+def audit_data(c, me, camp_id, buyer="", num="", limit=3000):
+    where, wargs = _sales_filter(c, f"c:{int(camp_id)}")
+    if me["role"] != "Admin":
+        where += " AND username = ANY(%s)"
+        wargs = (*wargs, get_subtree(c, me["username"]))
+    if buyer:
+        try:
+            kind, bid = buyer.split(":", 1)
+            bid = int(bid)
+        except ValueError:
+            kind, bid = "", 0
+        if kind == "Customer":
+            where += " AND customer_type='Customer' AND customer_id=%s"
+            wargs = (*wargs, bid)
+        elif kind == "User":
+            c.execute("SELECT username FROM Users WHERE id=%s", (bid,))
+            r = c.fetchone()
+            sub = get_subtree(c, r[0]) if r else []
+            where += " AND ((customer_type='User' AND customer_id=%s) OR username = ANY(%s))"
+            wargs = (*wargs, bid, sub)
+    num = (num or "").strip()
+    if num:
+        where += " AND num = %s"
+        wargs = (*wargs, num)
+    c.execute(f"SELECT COALESCE(SUM(amount),0), COALESCE(SUM(discount),0), COALESCE(SUM(net),0), COUNT(*), COUNT(DISTINCT bill_no) "
+              f"FROM Transactions WHERE 1=1{where}", wargs)
+    t = c.fetchone()
+    c.execute(f"SELECT timestamp, bill_no, username, customer_name, customer_type, type, num, amount, discount, net, payout_rate "
+              f"FROM Transactions WHERE 1=1{where} ORDER BY id DESC LIMIT {int(limit)}", wargs)
+    rows = c.fetchall()
+    return {"rows": rows, "amount": float(t[0]), "discount": float(t[1]), "net": float(t[2]), "count": t[3], "bills": t[4],
+            "truncated": t[3] > len(rows)}
+
+
+_AUDIT_HTML = """
+<div class="card shadow p-3">
+  <h3 class="text-primary fw-bold mb-3">{{ title }}</h3>
+  <form method="GET" action="{{ action }}" class="row g-2 align-items-end mb-3">
+    {% for k, v in hidden.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+    <div class="col-md-4"><label class="form-label small fw-bold">งวด</label>
+      <select name="camp" class="form-select form-select-sm">{% for o in camps %}<option value="{{ o.value }}" {{ 'selected' if o.value == camp|string }}>{{ o.label }}</option>{% endfor %}</select></div>
+    <div class="col-md-4"><label class="form-label small fw-bold">ผู้ซื้อ (ลูกค้า / ผู้ใช้ใต้สายงาน)</label>
+      <select name="buyer" class="form-select form-select-sm"><option value="">— ทั้งหมด —</option>{% for o in buyers %}<option value="{{ o.value }}" {{ 'selected' if o.value == buyer }}>{{ o.label }}</option>{% endfor %}</select></div>
+    <div class="col-md-2"><label class="form-label small fw-bold">เลข (ไม่บังคับ)</label><input type="text" name="num" value="{{ num }}" class="form-control form-control-sm" maxlength="3"></div>
+    <div class="col-md-2"><button class="btn btn-primary btn-sm w-100 fw-bold" type="submit">🔍 แสดงข้อมูล</button></div>
+  </form>
+  <div class="row g-2 mb-3 text-center">
+    <div class="col"><div class="border rounded p-2 bg-light"><div class="small text-muted">บิล</div><b>{{ d.bills }}</b></div></div>
+    <div class="col"><div class="border rounded p-2 bg-light"><div class="small text-muted">รายการ</div><b>{{ d.count }}</b></div></div>
+    <div class="col"><div class="border rounded p-2 bg-light"><div class="small text-muted">ยอดซื้อ</div><b>{{ "{:,.2f}".format(d.amount) }}</b></div></div>
+    <div class="col"><div class="border rounded p-2 bg-light"><div class="small text-muted">ส่วนลด</div><b class="text-danger">{{ "{:,.2f}".format(d.discount) }}</b></div></div>
+    <div class="col"><div class="border rounded p-2 bg-light"><div class="small text-muted">ยอดสุทธิ</div><b class="text-success">{{ "{:,.2f}".format(d.net) }}</b></div></div>
+  </div>
+  {% if d.truncated %}<div class="alert alert-warning py-1 small">แสดง {{ d.rows|length }} รายการล่าสุดจากทั้งหมด {{ d.count }} รายการ — เลือกผู้ซื้อหรือเลขเพื่อดูให้แคบลง (ยอดรวมด้านบนนับครบทั้งหมด)</div>{% endif %}
+  <div class="table-responsive" style="max-height:640px">
+    <table class="table table-striped table-bordered table-sm text-center align-middle">
+      <thead class="table-dark" style="position:sticky;top:0"><tr><th>เวลา</th><th>เลขที่บิล</th><th>ผู้บันทึก</th><th>ผู้ซื้อ</th><th>ประเภท</th><th>เลข</th><th>ยอดซื้อ</th><th>ส่วนลด</th><th>สุทธิ</th><th>อัตราจ่าย</th></tr></thead>
+      <tbody>
+      {% for r in d.rows %}
+        <tr><td><small>{{ r[0] }}</small></td><td><code>{{ r[1] }}</code></td><td><span class="badge bg-secondary">{{ r[2] }}</span></td>
+        <td><b>{{ r[3] }}</b> <span class="badge {{ 'bg-primary' if r[4] == 'User' else 'bg-info text-dark' }}">{{ 'สายงาน' if r[4] == 'User' else 'ลูกค้า' }}</span></td>
+        <td>{{ r[5] }}</td><td><b class="text-primary">{{ r[6] }}</b></td>
+        <td class="text-end">{{ "{:,.2f}".format(r[7] | float) }}</td><td class="text-end text-danger">{{ "{:,.2f}".format(r[8] | float) }}</td>
+        <td class="text-end text-success fw-bold">{{ "{:,.2f}".format(r[9] | float) }}</td><td><span class="badge bg-success">{{ r[10] }}</span></td></tr>
+      {% else %}<tr><td colspan="10" class="text-muted py-3">ไม่พบรายการตามเงื่อนไขที่เลือก</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+
+
+def render_audit(c, me, action, hidden, title, camp="", buyer="", num="", draw=""):
+    camps, buyers = audit_options(c, me)
+    ids = [o["value"] for o in camps]
+    if camp not in ids:
+        camp = ""
+        if draw:   # รองรับลิงก์เดิมที่ส่ง draw = "ชื่อหวย งวด วันที่"
+            for o in camps:
+                if o["label"].replace(" (ปิดแล้ว)", "") == draw.strip():
+                    camp = o["value"]
+                    break
+        if not camp and ids:
+            camp = ids[0]
+    d = audit_data(c, me, camp, buyer, num) if camp else {"rows": [], "amount": 0.0, "discount": 0.0, "net": 0.0, "count": 0, "bills": 0, "truncated": False}
+    return _Jinja(_AUDIT_HTML, autoescape=True).render(action=action, hidden=hidden, title=title, camps=camps, buyers=buyers,
+                                                       camp=camp, buyer=buyer, num=num, d=d)
+
+
+# ============================================================ ยกเลิกบิล
+
+_TX_COPY = "draw_date, timestamp, username, customer_id, customer_name, customer_type, bill_no, num, type, amount, status, discount, net, payout_rate, lotto_name"
+
+
+def _result_recorded(c, draw_date):
+    c.execute("SELECT 1 FROM DrawResults WHERE (draw_date=%s OR draw_date ILIKE %s) AND COALESCE(prize_1,'')<>'' LIMIT 1",
+              (draw_date, f"%{like_escape(draw_date)}%"))
+    return bool(c.fetchone())
+
+
+def _camp_of_tx(c, draw_date, lotto_name):
+    c.execute("SELECT id FROM LotteryCampaigns WHERE draw_date=%s OR draw_date ILIKE %s ORDER BY id DESC", (draw_date, f"%{like_escape(draw_date)}%"))
+    ids = [r[0] for r in c.fetchall()]
+    best = None
+    for i in ids:
+        camp = get_campaign(c, i)
+        if camp and (not lotto_name or _name_key(camp["lotto_name"]) == _name_key(lotto_name)):
+            return camp
+        best = best or camp
+    return best
+
+
+def bill_cancel_state(c, me, camp, bill_user):
+    """(ยกเลิกได้ไหม, เหตุผลถ้าไม่ได้)"""
+    if me["role"] != "Admin" and (bill_user or "").lower() != me["username"].lower():
+        return False, "ยกเลิกได้เฉพาะบิลที่คุณคีย์เอง"
+    if camp and _result_recorded(c, camp["draw_date"]):
+        return False, "งวดนี้ออกผลรางวัลแล้ว ยกเลิกไม่ได้"
+    if me["role"] != "Admin":
+        if not camp:
+            return False, "ไม่พบงวดของบิลนี้"
+        ok, why = campaign_open(camp)
+        if not ok:
+            return False, "ปิดรับงวดแล้ว ยกเลิกไม่ได้ (ติดต่อแอดมิน)"
+    return True, ""
+
+
+def cancel_bill(c, me, bill_no, reason=""):
+    """ยกเลิกบิล: ย้ายรายการไปเก็บในตาราง CancelledTransactions แล้วลบออกจาก Transactions
+    (รายงาน/ยอดขายสด/ความเสี่ยง/ผลรางวัล จึงไม่นับบิลนี้อีก)  คืน (ok, ข้อความ)"""
+    bill_no = (bill_no or "").strip()
+    if not bill_no:
+        return False, "ไม่ระบุเลขที่บิล"
+    c.execute("SELECT id, draw_date, lotto_name, username FROM Transactions WHERE bill_no=%s FOR UPDATE", (bill_no,))
+    rows = c.fetchall()
+    if not rows:
+        return False, "ไม่พบบิลนี้ (อาจถูกยกเลิกไปแล้ว)"
+    draw_date, lotto_name, owner = rows[0][1], rows[0][2], rows[0][3]
+    camp = _camp_of_tx(c, draw_date, lotto_name)
+    ok, why = bill_cancel_state(c, me, camp, owner)
+    if not ok:
+        return False, why
+    now = get_thai_time().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(f"INSERT INTO CancelledTransactions (orig_id, {_TX_COPY}, cancelled_by, cancelled_at, reason) "
+              f"SELECT id, {_TX_COPY}, %s, %s, %s FROM Transactions WHERE bill_no=%s AND draw_date=%s",
+              (me["username"], now, (reason or "").strip()[:200], bill_no, draw_date))
+    c.execute("DELETE FROM Transactions WHERE bill_no=%s AND draw_date=%s", (bill_no, draw_date))
+    return True, f"ยกเลิกบิล {bill_no} เรียบร้อย ({len(rows)} รายการ)"
+
+
+def list_bills(c, me, camp_id, limit=200):
+    where, wargs = _sales_filter(c, f"c:{int(camp_id)}")
+    if me["role"] != "Admin":
+        where += " AND LOWER(username)=LOWER(%s)"
+        wargs = (*wargs, me["username"])
+    c.execute(f"SELECT bill_no, MAX(timestamp), MAX(username), MAX(customer_name), MAX(customer_type), COUNT(*), "
+              f"COALESCE(SUM(amount),0), COALESCE(SUM(net),0) FROM Transactions WHERE bill_no IS NOT NULL{where} "
+              f"GROUP BY bill_no ORDER BY MAX(id) DESC LIMIT {int(limit)}", wargs)
+    return c.fetchall()
+
+
+_CANCEL_HTML = """
+<div class="card shadow p-3">
+  <h3 class="text-danger fw-bold mb-1">🗑️ ยกเลิกบิล</h3>
+  <div class="text-muted mb-2">{{ camp_label }} · {{ 'แอดมินยกเลิกได้ทุกบิลจนกว่าจะออกผล' if is_admin else 'ยกเลิกได้เฉพาะบิลที่คุณคีย์เอง ขณะที่งวดยังเปิดรับ' }}</div>
+  {% if blocked_reason %}<div class="alert alert-warning py-2">{{ blocked_reason }}</div>{% endif %}
+  <input type="text" id="cb-q" class="form-control form-control-sm mb-2" placeholder="🔍 ค้นหาเลขที่บิล / ชื่อผู้ซื้อ" style="max-width:320px">
+  <div class="table-responsive" style="max-height:620px">
+  <table class="table table-sm table-bordered table-striped text-center align-middle" id="cb-t">
+    <thead class="table-dark" style="position:sticky;top:0"><tr><th>เวลา</th><th>เลขที่บิล</th><th>ผู้บันทึก</th><th>ผู้ซื้อ</th><th>รายการ</th><th>ยอดซื้อ</th><th>สุทธิ</th><th>จัดการ</th></tr></thead>
+    <tbody>
+    {% for b in bills %}
+      <tr><td><small>{{ b.time }}</small></td><td><code>{{ b.bill_no }}</code></td><td>{{ b.user }}</td><td><b>{{ b.buyer }}</b></td>
+      <td>{{ b.n }}</td><td class="text-end">{{ "{:,.2f}".format(b.amount) }}</td><td class="text-end">{{ "{:,.2f}".format(b.net) }}</td>
+      <td>{% if b.can %}
+        <form method="POST" action="{{ action }}" class="d-flex gap-1 justify-content-center" onsubmit="return confirm('ยืนยันยกเลิกบิล {{ b.bill_no }} ? การยกเลิกจะนำรายการทั้งบิลออกจากยอดขาย');">
+          {% for k, v in hidden.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+          <input type="hidden" name="bill_no" value="{{ b.bill_no }}">
+          <input type="text" name="reason" class="form-control form-control-sm" placeholder="เหตุผล (ไม่บังคับ)" style="width:150px" maxlength="200">
+          <button class="btn btn-danger btn-sm fw-bold" type="submit">ยกเลิกบิล</button>
+        </form>
+      {% else %}<small class="text-muted">{{ b.why }}</small>{% endif %}</td></tr>
+    {% else %}<tr><td colspan="8" class="text-muted py-3">ยังไม่มีบิลในงวดนี้</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+</div>
+<script>
+document.getElementById('cb-q').oninput=function(){var q=this.value.toLowerCase();
+ document.querySelectorAll('#cb-t tbody tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)<0?'none':'';});};
+</script>
+"""
+
+
+def render_cancel_bills(c, me, camp, action, hidden):
+    bills, blocked_reason = [], ""
+    for r in list_bills(c, me, camp["id"]):
+        ok, why = bill_cancel_state(c, me, camp, r[2])
+        bills.append({"bill_no": r[0], "time": r[1], "user": r[2], "buyer": r[3], "n": r[5],
+                      "amount": float(r[6]), "net": float(r[7]), "can": ok, "why": why})
+    if bills and not any(b["can"] for b in bills):
+        blocked_reason = bills[0]["why"]
+    return _Jinja(_CANCEL_HTML, autoescape=True).render(bills=bills, action=action, hidden=hidden, is_admin=me["role"] == "Admin",
+                                                        camp_label=f"{camp['lotto_name']} งวด {camp['draw_date']}", blocked_reason=blocked_reason)
