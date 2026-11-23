@@ -14,6 +14,7 @@ common.py — โมดูลกลางที่ "ระบบหลัก" �
 import base64
 import hashlib
 import hmac
+import json
 import math
 import os
 import re
@@ -21,6 +22,8 @@ import secrets
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import urllib.error
+import urllib.request
 from urllib.parse import quote
 
 import psycopg2
@@ -722,7 +725,7 @@ def generate_bill_no(c, lotto_name, draw_date, t_type, t_id):
 
 # ============================================================ ยอดขายเรียลไทม์ (แอดมิน) + เจาะลึกตามสายงาน
 
-BUILD = "2026-11-15.1"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
+BUILD = "2026-11-24.1"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
 
 _SALES_COLS = "COALESCE(SUM(amount),0), COALESCE(SUM(discount),0), COALESCE(SUM(net),0), COUNT(DISTINCT bill_no), COUNT(*)"
 
@@ -990,6 +993,20 @@ MIGRATIONS = [
     "username TEXT, customer_id INTEGER, customer_name TEXT, customer_type TEXT, bill_no TEXT, num TEXT, type TEXT, "
     "amount NUMERIC DEFAULT 0, status TEXT, discount NUMERIC DEFAULT 0, net NUMERIC DEFAULT 0, payout_rate NUMERIC DEFAULT 0, "
     "lotto_name TEXT, cancelled_by TEXT, cancelled_at TEXT, reason TEXT)",
+    "ALTER TABLE Users ADD COLUMN IF NOT EXISTS credit_enabled BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS credit_enabled BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS link_code TEXT",
+    "UPDATE Customers SET link_code = upper(substr(md5(random()::text || id::text), 1, 6)) WHERE link_code IS NULL OR link_code = ''",
+    "CREATE TABLE IF NOT EXISTS CreditLedger (id SERIAL PRIMARY KEY, target_type TEXT, target_id INTEGER, delta NUMERIC(14,2), "
+    "kind TEXT, bill_no TEXT, note TEXT, by_user TEXT, created_at TEXT)",
+    "CREATE INDEX IF NOT EXISTS ix_creditledger_target ON CreditLedger (target_type, target_id)",
+    "CREATE TABLE IF NOT EXISTS ChannelSettings (id SERIAL PRIMARY KEY, owner_username TEXT, channel TEXT, webhook_key TEXT, "
+    "config TEXT, enabled BOOLEAN DEFAULT TRUE, updated_at TEXT)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_channelsettings_owner ON ChannelSettings (owner_username, channel)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_channelsettings_key ON ChannelSettings (webhook_key)",
+    "CREATE TABLE IF NOT EXISTS ChannelLinks (id SERIAL PRIMARY KEY, channel TEXT, external_id TEXT, owner_username TEXT, "
+    "customer_id INTEGER, campaign_id INTEGER, created_at TEXT)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_channellinks ON ChannelLinks (channel, external_id, owner_username)",
     "CREATE TABLE IF NOT EXISTS AgentSettlements (id SERIAL PRIMARY KEY, agent_username VARCHAR(100), "
     "target_name VARCHAR(100), amount NUMERIC(12,2), settle_type VARCHAR(20), note TEXT, timestamp TEXT)",
     # เรตแยกหวย: คีย์มาตรฐานคือ target_id ("12" = ลูกค้า, "user_5" = ผู้ใช้); เก็บ customer_id ไว้ให้ระบบหลักเดิมยังทำงานได้
@@ -1448,6 +1465,7 @@ def cancel_bill(c, me, bill_no, reason=""):
               f"SELECT id, {_TX_COPY}, %s, %s, %s FROM Transactions WHERE bill_no=%s AND draw_date=%s",
               (me["username"], now, (reason or "").strip()[:200], bill_no, draw_date))
     c.execute("DELETE FROM Transactions WHERE bill_no=%s AND draw_date=%s", (bill_no, draw_date))
+    credit_refund(c, bill_no, me["username"])
     return True, f"ยกเลิกบิล {bill_no} เรียบร้อย ({len(rows)} รายการ)"
 
 
@@ -1504,3 +1522,532 @@ def render_cancel_bills(c, me, camp, action, hidden):
         blocked_reason = bills[0]["why"]
     return _Jinja(_CANCEL_HTML, autoescape=True).render(bills=bills, action=action, hidden=hidden, is_admin=me["role"] == "Admin",
                                                         camp_label=f"{camp['lotto_name']} งวด {camp['draw_date']}", blocked_reason=blocked_reason)
+
+
+# ============================================================ คีย์ด่วน (ต่อเนื่อง / วางโพย) + โพยร่างแบบ 6 คอลัมน์
+
+TOP_TYPES = ("3ตัวตรง", "2ตัวบน", "วิ่งบน")
+_AMT = r"\d+(?:\.\d+)?"
+
+
+def parse_quick(text):
+    """แปลงข้อความคีย์ด่วนเป็นรายการ [(เลข, ยอดบน, ยอดล่าง)]
+    รูปแบบ:  เลข=บน*ล่าง   คั่นด้วย , หรือขึ้นบรรทัดใหม่   เลขหลายตัวยอดเท่ากัน:  14,41=10*10
+    ใส่ 0 ในตำแหน่งที่ไม่ซื้อ  เช่น 456=0*50   (ใส่ยอดเดียว 123=100 = ซื้อฝั่งบนอย่างเดียว)
+    คืน (entries, errors)"""
+    s = (text or "").replace("＝", "=").replace("＊", "*").replace("×", "*")
+    s = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", "*", s)
+    s = re.sub(r"\s*=\s*", "=", s)
+    s = re.sub(r"\s*\*\s*", "*", s)
+    entries, errors, pending = [], [], []
+    for tok in [t for t in re.split(r"[,\s;]+", s) if t]:
+        if "=" not in tok:
+            pending.append(tok)
+            continue
+        left, right = tok.split("=", 1)
+        if left:
+            pending.append(left)
+        m = re.fullmatch(rf"({_AMT})(?:\*({_AMT}))?", right)
+        if not pending:
+            errors.append(f"'{tok}' ไม่มีเลขที่จะซื้อ")
+            continue
+        if not m:
+            errors.append(f"ยอดซื้อไม่ถูกต้อง: '{right}' (ต้องเป็น บน*ล่าง เช่น 10*20)")
+            pending = []
+            continue
+        top, bot = float(m.group(1)), float(m.group(2) or 0)
+        for n in pending:
+            if not re.fullmatch(r"\d{1,3}", n):
+                errors.append(f"เลขไม่ถูกต้อง: '{n}' (ต้องเป็นตัวเลข 1-3 หลัก)")
+            elif top <= 0 and bot <= 0:
+                errors.append(f"เลข {n} ไม่มียอดซื้อ (บนและล่างเป็น 0)")
+            else:
+                entries.append((n, top, bot))
+        pending = []
+    if pending:
+        errors.append("เลขที่ไม่มียอดซื้อ (ลืมใส่ =ยอด): " + ", ".join(pending[:20]))
+    return entries, errors
+
+
+def make_draft_rows(rates, blocked, entries, username, t_type, t_id, camp, max_amount=1_000_000):
+    """สร้างแถว TempDraft จาก [(เลข, บน, ล่าง)]  คืน (rows, rejected, invalid)"""
+    rows, rejected, invalid = [], [], []
+    for n, top, bot in entries:
+        if not re.fullmatch(r"\d{1,3}", n) or not (0 <= top <= max_amount and 0 <= bot <= max_amount):
+            invalid.append(n)
+            continue
+        st = blocked.get(n, "ปกติ")
+        if st == "ปิดรับ":
+            rejected.append(n)
+            continue
+        for amt, (ptype, pay_key, kind) in zip((top, bot), PLAYS[len(n)]):
+            if amt <= 0:
+                continue
+            disc_amt = round(amt * disc_pct(rates, kind) / 100.0, 2)
+            rows.append((username, str(t_id), t_type, n, amt, ptype, rates[pay_key], disc_amt, round(amt - disc_amt, 2),
+                         st, camp["lotto_name"], camp["draw_date"]))
+    return rows, rejected, invalid
+
+
+def group_draft(drafts):
+    """TempDraft (id,num,amt,status,type,payout_rate,discount,net) -> แถวต่อ 'เลข' (บน/3ตรง | ล่าง/โต๊ด)
+    rate ที่แสดงเป็น 'อัตราจ่ายจริง' (เลขจ่ายครึ่งแสดงครึ่งหนึ่ง)"""
+    order, g = [], {}
+    for d in drafts:
+        n = d[1]
+        if n not in g:
+            g[n] = {"num": n, "ids": [], "top": 0.0, "bot": 0.0, "top_rate": None, "bot_rate": None,
+                    "disc": 0.0, "net": 0.0, "status": d[3] or "ปกติ"}
+            order.append(n)
+        r = g[n]
+        r["ids"].append(d[0])
+        slot = "top" if d[4] in TOP_TYPES else "bot"
+        r[slot] += float(d[2] or 0)
+        rate = float(d[5] or 0)
+        r[slot + "_rate"] = rate / 2.0 if (d[3] or "ปกติ") != "ปกติ" else rate
+        r["disc"] += float(d[6] or 0)
+        r["net"] += float(d[7] or 0)
+    rows = [g[n] for n in order]
+    for r in rows:
+        r["total"] = r["top"] + r["bot"]
+        r["ids_csv"] = ",".join(str(i) for i in r["ids"])
+    tot = {"top": sum(r["top"] for r in rows), "bot": sum(r["bot"] for r in rows),
+           "amt": sum(r["total"] for r in rows), "disc": sum(r["disc"] for r in rows), "net": sum(r["net"] for r in rows)}
+    return rows, tot
+
+
+# ============================================================ ระบบเครดิต
+
+def _acct_table(kind):
+    return "Users" if kind == "User" else "Customers"
+
+
+def credit_enabled(c, kind, tid):
+    c.execute(f"SELECT COALESCE(credit_enabled, FALSE) FROM {_acct_table(kind)} WHERE id=%s", (tid,))
+    r = c.fetchone()
+    return bool(r and r[0])
+
+
+def credit_balance(c, kind, tid):
+    c.execute("SELECT COALESCE(SUM(delta),0) FROM CreditLedger WHERE target_type=%s AND target_id=%s", (kind, tid))
+    return float(c.fetchone()[0] or 0)
+
+
+def credit_account(c, t_type, t_id, me):
+    """บัญชีเครดิตที่ต้องตัดเมื่อออกบิล: ผู้ซื้อ (ถ้าเปิดเครดิตไว้) ไม่เช่นนั้นผู้บันทึก (ตัวแทน) ถ้าเปิดเครดิตไว้ ไม่มีก็ไม่ตัด"""
+    if credit_enabled(c, t_type, t_id):
+        return (t_type, t_id)
+    if me and credit_enabled(c, "User", me["id"]):
+        return ("User", me["id"])
+    return None
+
+
+def _ledger(c, kind, tid, delta, ltype, bill_no, note, by):
+    c.execute("INSERT INTO CreditLedger (target_type, target_id, delta, kind, bill_no, note, by_user, created_at) "
+              "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+              (kind, tid, round(float(delta), 2), ltype, bill_no, (note or "")[:200], by, get_thai_time().strftime("%Y-%m-%d %H:%M:%S")))
+
+
+def credit_charge(c, acct, amount, bill_no, by):
+    """ตัดเครดิตตอนออกบิล (ล็อกแถวบัญชีกันตัดซ้อน)  คืน (ok, ข้อความ)"""
+    kind, tid = acct
+    c.execute(f"SELECT 1 FROM {_acct_table(kind)} WHERE id=%s FOR UPDATE", (tid,))
+    bal = credit_balance(c, kind, tid)
+    if bal + 1e-9 < amount:
+        return False, f"เครดิตไม่พอ (คงเหลือ {bal:,.2f} บาท ต้องใช้ {amount:,.2f} บาท) กรุณาติดต่อแอดมินเพื่อเพิ่มเครดิต"
+    _ledger(c, kind, tid, -amount, "purchase", bill_no, "ซื้อโพย", by)
+    return True, ""
+
+
+def credit_refund(c, bill_no, by):
+    """คืนเครดิตเมื่อยกเลิกบิล (คืนครั้งเดียวต่อบิล)"""
+    c.execute("SELECT target_type, target_id, SUM(delta) FROM CreditLedger WHERE bill_no=%s AND kind IN ('purchase','refund') "
+              "GROUP BY target_type, target_id", (bill_no,))
+    for kind, tid, net in c.fetchall():
+        if float(net or 0) < 0:
+            _ledger(c, kind, tid, -float(net), "refund", bill_no, "ยกเลิกบิล", by)
+
+
+def credit_adjust(c, me, target, op, amount=0.0, note=""):
+    """แอดมินจัดสรร/หัก/เคลียร์ยอด/เปิด-ปิดระบบเครดิต  target='User:5' | 'Customer:3'  คืน (ok, ข้อความ)"""
+    if me["role"] != "Admin":
+        return False, "เฉพาะแอดมินเท่านั้นที่จัดการเครดิตได้"
+    try:
+        kind, tid = target.split(":", 1)
+        tid = int(tid)
+        assert kind in ("User", "Customer")
+    except (ValueError, AssertionError):
+        return False, "ข้อมูลบัญชีไม่ถูกต้อง"
+    name = get_target_name(c, kind, tid)
+    if name is None:
+        return False, "ไม่พบบัญชีนี้"
+    if op in ("enable", "disable"):
+        c.execute(f"UPDATE {_acct_table(kind)} SET credit_enabled=%s WHERE id=%s", (op == "enable", tid))
+        return True, f"{'เปิด' if op == 'enable' else 'ปิด'}ระบบเครดิตของ {name} แล้ว"
+    c.execute(f"SELECT 1 FROM {_acct_table(kind)} WHERE id=%s FOR UPDATE", (tid,))
+    if op == "clear":
+        bal = credit_balance(c, kind, tid)
+        if abs(bal) < 0.005:
+            return False, "ยอดเป็น 0 อยู่แล้ว"
+        _ledger(c, kind, tid, -bal, "settle", None, note or "เคลียร์ยอด", me["username"])
+        return True, f"เคลียร์ยอดของ {name} (ปรับ {-bal:+,.2f})"
+    amount = float(amount or 0)
+    if amount <= 0 or amount > 1e9:
+        return False, "จำนวนเงินต้องมากกว่า 0"
+    if op == "allocate":
+        c.execute(f"UPDATE {_acct_table(kind)} SET credit_enabled=TRUE WHERE id=%s", (tid,))
+        _ledger(c, kind, tid, amount, "allocate", None, note or "จัดสรรเครดิต", me["username"])
+        return True, f"จัดสรรเครดิต {amount:,.2f} ให้ {name} แล้ว"
+    if op == "deduct":
+        _ledger(c, kind, tid, -amount, "adjust", None, note or "หัก/ปรับยอด", me["username"])
+        return True, f"หักเครดิต {amount:,.2f} จาก {name} แล้ว"
+    return False, "คำสั่งไม่ถูกต้อง"
+
+
+_CREDIT_HTML = """
+<div class="card shadow p-3">
+  <h3 class="fw-bold text-primary mb-1">💳 ระบบเครดิต</h3>
+  <div class="text-muted small mb-3">{% if is_admin %}แอดมินจัดสรรเครดิตให้ผู้ใช้/ตัวแทน/ลูกค้า — เมื่อออกบิลระบบจะตัดเครดิตของผู้ซื้อ (ถ้าผู้ซื้อไม่ได้เปิดเครดิต จะตัดจากเครดิตของผู้บันทึกที่เปิดเครดิตไว้) ถ้าไม่พอจะออกบิลไม่ได้ · ยกเลิกบิลจะคืนเครดิตให้อัตโนมัติ{% else %}แสดงเครดิตของคุณและลูกค้าของคุณ (แอดมินเป็นผู้จัดสรร){% endif %}</div>
+  <input type="text" id="cr-q" class="form-control form-control-sm mb-2" placeholder="🔍 ค้นหาชื่อ" style="max-width:280px">
+  <div class="table-responsive">
+  <table class="table table-sm table-bordered align-middle text-center" id="cr-t">
+    <thead class="table-dark"><tr><th>ชื่อ</th><th>ประเภท</th><th>ระบบเครดิต</th><th>คงเหลือ</th><th>ซื้อไปแล้ว</th>{% if is_admin %}<th style="min-width:420px">จัดการ</th>{% endif %}</tr></thead>
+    <tbody>
+    {% for a in accts %}
+      <tr><td class="text-start"><b>{{ a.name }}</b></td><td>{{ 'ผู้ใช้/ตัวแทน' if a.kind == 'User' else 'ลูกค้า' }}</td>
+      <td>{% if a.enabled %}<span class="badge bg-success">เปิด</span>{% else %}<span class="badge bg-secondary">ปิด</span>{% endif %}</td>
+      <td class="fw-bold {{ 'text-danger' if a.balance < 0 else 'text-success' }}">{{ "{:,.2f}".format(a.balance) }}</td>
+      <td>{{ "{:,.2f}".format(a.used) }}</td>
+      {% if is_admin %}<td>
+        <form method="POST" action="{{ action }}" class="d-flex flex-wrap gap-1 justify-content-center">
+          {% for k, v in hidden.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+          <input type="hidden" name="target" value="{{ a.kind }}:{{ a.id }}">
+          <input type="number" name="amount" step="0.01" min="0" class="form-control form-control-sm" placeholder="จำนวนเงิน" style="width:110px">
+          <input type="text" name="note" class="form-control form-control-sm" placeholder="หมายเหตุ" style="width:120px" maxlength="200">
+          <button name="op" value="allocate" class="btn btn-success btn-sm">➕ จัดสรร/เติม</button>
+          <button name="op" value="deduct" class="btn btn-warning btn-sm">➖ หัก</button>
+          <button name="op" value="clear" class="btn btn-outline-dark btn-sm" onclick="return confirm('เคลียร์ยอดของ {{ a.name }} ให้เป็น 0 ?')">เคลียร์ยอด</button>
+          {% if a.enabled %}<button name="op" value="disable" class="btn btn-outline-secondary btn-sm">ปิดเครดิต</button>
+          {% else %}<button name="op" value="enable" class="btn btn-outline-primary btn-sm">เปิดเครดิต</button>{% endif %}
+        </form></td>{% endif %}</tr>
+    {% else %}<tr><td colspan="6" class="text-muted py-3">ไม่มีบัญชี</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+  <h6 class="fw-bold mt-3">🧾 รายการล่าสุด</h6>
+  <div class="table-responsive" style="max-height:320px"><table class="table table-sm table-striped table-bordered text-center" style="font-size:.8rem">
+    <thead class="table-light"><tr><th>เวลา</th><th>บัญชี</th><th>ประเภท</th><th>จำนวน</th><th>บิล</th><th>หมายเหตุ</th><th>โดย</th></tr></thead><tbody>
+    {% for l in ledger %}<tr><td>{{ l[0] }}</td><td>{{ l[1] }}</td><td>{{ l[2] }}</td><td class="{{ 'text-success' if l[3] > 0 else 'text-danger' }}">{{ "{:+,.2f}".format(l[3]) }}</td><td>{{ l[4] or '' }}</td><td>{{ l[5] or '' }}</td><td>{{ l[6] }}</td></tr>
+    {% else %}<tr><td colspan="7" class="text-muted">ยังไม่มีรายการ</td></tr>{% endfor %}</tbody></table></div>
+</div>
+<script>document.getElementById('cr-q').oninput=function(){var q=this.value.toLowerCase();document.querySelectorAll('#cr-t tbody tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)<0?'none':'';});};</script>
+"""
+
+_KIND_TH = {"allocate": "จัดสรร", "adjust": "หัก/ปรับ", "settle": "เคลียร์ยอด", "purchase": "ซื้อโพย", "refund": "คืนเครดิต"}
+
+
+def render_credits(c, me, action, hidden):
+    is_admin = me["role"] == "Admin"
+    if is_admin:
+        c.execute("SELECT 'User', id, username, COALESCE(credit_enabled,FALSE) FROM Users ORDER BY username LIMIT 1000")
+        accts = c.fetchall()
+        c.execute("SELECT 'Customer', id, name, COALESCE(credit_enabled,FALSE) FROM Customers ORDER BY name LIMIT 2000")
+        accts += c.fetchall()
+    else:
+        c.execute("SELECT 'User', id, username, COALESCE(credit_enabled,FALSE) FROM Users WHERE id=%s", (me["id"],))
+        accts = c.fetchall()
+        c.execute("SELECT 'Customer', id, name, COALESCE(credit_enabled,FALSE) FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY name", (me["username"],))
+        accts += c.fetchall()
+    c.execute("SELECT target_type, target_id, COALESCE(SUM(delta),0), COALESCE(SUM(CASE WHEN kind IN ('purchase') THEN -delta END),0) "
+              "FROM CreditLedger GROUP BY target_type, target_id")
+    bal = {(r[0], r[1]): (float(r[2]), float(r[3])) for r in c.fetchall()}
+    rows = [{"kind": k, "id": i, "name": n, "enabled": e, "balance": bal.get((k, i), (0, 0))[0], "used": bal.get((k, i), (0, 0))[1]}
+            for k, i, n, e in accts]
+    rows.sort(key=lambda r: (not r["enabled"], r["name"].lower()))
+    names = {(r["kind"], r["id"]): r["name"] for r in rows}
+    if is_admin:
+        c.execute("SELECT created_at, target_type, target_id, kind, delta, bill_no, note, by_user FROM CreditLedger ORDER BY id DESC LIMIT 60")
+    else:
+        keys = list(names)
+        c.execute("SELECT created_at, target_type, target_id, kind, delta, bill_no, note, by_user FROM CreditLedger ORDER BY id DESC LIMIT 400")
+    ledger = []
+    for r in c.fetchall():
+        nm = names.get((r[1], r[2]))
+        if nm is None and not is_admin:
+            continue
+        ledger.append((r[0], nm or f"{r[1]}#{r[2]}", _KIND_TH.get(r[3], r[3]), float(r[4]), r[5], r[6], r[7]))
+    return _Jinja(_CREDIT_HTML, autoescape=True).render(accts=rows, ledger=ledger[:60], action=action, hidden=hidden, is_admin=is_admin)
+
+
+# ============================================================ เชื่อมต่อ LINE / Facebook Messenger
+
+CHANNELS = {
+    "line": {"title": "LINE Official Account", "fields": [
+        ("access_token", "Channel access token (long-lived)", True),
+        ("channel_secret", "Channel secret", True)]},
+    "messenger": {"title": "Facebook Messenger (Page)", "fields": [
+        ("access_token", "Page access token", True),
+        ("app_secret", "App secret", True),
+        ("verify_token", "Verify token (ตั้งเองอะไรก็ได้ แล้วใช้ค่าเดียวกันในหน้า Webhook ของ Meta)", False)]},
+}
+
+
+def chan_get(c, owner, channel):
+    c.execute("SELECT webhook_key, config, COALESCE(enabled, TRUE) FROM ChannelSettings WHERE owner_username=%s AND channel=%s", (owner, channel))
+    r = c.fetchone()
+    if not r:
+        return None
+    try:
+        cfg = json.loads(r[1] or "{}")
+    except ValueError:
+        cfg = {}
+    return {"key": r[0], "cfg": cfg, "enabled": bool(r[2])}
+
+
+def chan_by_key(c, channel, key):
+    c.execute("SELECT owner_username, config, COALESCE(enabled, TRUE) FROM ChannelSettings WHERE channel=%s AND webhook_key=%s", (channel, key))
+    r = c.fetchone()
+    if not r or not r[2]:
+        return None
+    try:
+        return {"owner": r[0], "cfg": json.loads(r[1] or "{}")}
+    except ValueError:
+        return None
+
+
+def chan_save(c, owner, channel, new_cfg, enabled=True):
+    """บันทึกค่า: ช่องที่เว้นว่างจะคงค่าเดิมไว้ (ไม่แสดงรหัสลับกลับมาในหน้าเว็บ)"""
+    if channel not in CHANNELS:
+        return False
+    cur = chan_get(c, owner, channel)
+    cfg = dict(cur["cfg"]) if cur else {}
+    for k, _label, _secret in CHANNELS[channel]["fields"]:
+        v = (new_cfg.get(k) or "").strip()
+        if v:
+            cfg[k] = v
+    now = get_thai_time().strftime("%Y-%m-%d %H:%M:%S")
+    if cur:
+        c.execute("UPDATE ChannelSettings SET config=%s, enabled=%s, updated_at=%s WHERE owner_username=%s AND channel=%s",
+                  (json.dumps(cfg, ensure_ascii=False), enabled, now, owner, channel))
+    else:
+        c.execute("INSERT INTO ChannelSettings (owner_username, channel, webhook_key, config, enabled, updated_at) VALUES (%s,%s,%s,%s,%s,%s)",
+                  (owner, channel, secrets.token_urlsafe(18), json.dumps(cfg, ensure_ascii=False), enabled, now))
+    return True
+
+
+def verify_line_signature(secret, body: bytes, signature: str):
+    mac = base64.b64encode(hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
+    return hmac.compare_digest(mac, signature or "")
+
+
+def verify_fb_signature(secret, body: bytes, header: str):
+    mac = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mac, header or "")
+
+
+def _post_json(url, payload, headers):
+    req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                 headers={"Content-Type": "application/json", **headers}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return r.status, r.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "ignore")[:300]
+    except Exception as e:     # เครือข่าย/หมดเวลา
+        return 0, str(e)[:200]
+
+
+def line_send(cfg, to=None, messages=None, reply_token=None):
+    tok = cfg.get("access_token")
+    if not tok:
+        return False, "ยังไม่ได้ตั้งค่า LINE access token"
+    hdr = {"Authorization": f"Bearer {tok}"}
+    if reply_token:
+        st, body = _post_json("https://api.line.me/v2/bot/message/reply", {"replyToken": reply_token, "messages": messages}, hdr)
+    else:
+        st, body = _post_json("https://api.line.me/v2/bot/message/push", {"to": to, "messages": messages}, hdr)
+    return (st == 200), ("" if st == 200 else f"LINE {st}: {body[:120]}")
+
+
+def messenger_send(cfg, psid, text):
+    tok = cfg.get("access_token")
+    if not tok:
+        return False, "ยังไม่ได้ตั้งค่า Page access token"
+    st, body = _post_json("https://graph.facebook.com/v19.0/me/messages?access_token=" + quote(tok),
+                          {"recipient": {"id": psid}, "messaging_type": "RESPONSE", "message": {"text": text[:1900]}}, {})
+    return (st == 200), ("" if st == 200 else f"Messenger {st}: {body[:120]}")
+
+
+def send_text(channel, cfg, ext_id, text, reply_token=None):
+    if channel == "line":
+        return line_send(cfg, to=ext_id, messages=[{"type": "text", "text": text[:4900]}], reply_token=reply_token)
+    return messenger_send(cfg, ext_id, text)
+
+
+def _n(v):
+    return f"{v:,.2f}".rstrip("0").rstrip(".") if v else "-"
+
+
+def bill_text(b):
+    """ข้อความบิล (ใช้ส่งทาง Messenger / สำรองของ LINE)  b = dict จาก bill_dict"""
+    lines = [f"🎟️ {b['lotto']} งวด {b['draw']}", f"เลขที่บิล {b['bill_no']}", f"วันที่ {b['ts']}",
+             f"ลูกค้า: {b['customer']}   ผู้ขาย: {b['seller']}", "─" * 18, "เลข | บน/3ตรง | ล่าง/โต๊ด | รวม"]
+    for r in b["rows"][:120]:
+        lines.append(f"{r['num']} | {_n(r['top'])}{'('+format(r['top_rate'],'g')+')' if r['top_rate'] else ''} | "
+                     f"{_n(r['bot'])}{'('+format(r['bot_rate'],'g')+')' if r['bot_rate'] else ''} | {_n(r['total'])}")
+    if len(b["rows"]) > 120:
+        lines.append(f"... และอีก {len(b['rows']) - 120} รายการ")
+    lines += ["─" * 18, f"ยอดรวม {b['total']:,.2f} บาท"]
+    return "\n".join(lines)
+
+
+def bill_flex(b):
+    """LINE Flex Message หน้าตาเป็นบิล (ไม่ต้องใช้ไฟล์รูป/ฟอนต์บนเซิร์ฟเวอร์)"""
+    def t(text, **kw):
+        return {"type": "text", "text": str(text), "size": kw.pop("size", "sm"), **kw}
+
+    def row(cells, bold=False, color=None):
+        out = []
+        for i, (txt, flex, align) in enumerate(cells):
+            kw = {"flex": flex, "align": align, "wrap": True}
+            if bold:
+                kw["weight"] = "bold"
+            if color:
+                kw["color"] = color
+            out.append(t(txt, **kw))
+        return {"type": "box", "layout": "horizontal", "contents": out, "margin": "xs"}
+
+    body = [
+        row([(b["ts"], 1, "start"), (b["bill_no"], 1, "end")]),
+        row([("ลูกค้า: " + b["customer"], 1, "start"), ("ผู้ขาย: " + b["seller"], 1, "end")]),
+        {"type": "separator", "margin": "md"},
+        row([("เลข", 2, "start"), ("บน/3ตรง", 3, "end"), ("ล่าง/โต๊ด", 3, "end"), ("รวม", 2, "end")], bold=True),
+    ]
+    for r in b["rows"][:60]:
+        body.append(row([(r["num"], 2, "start"),
+                         (_n(r["top"]) + (f" ({r['top_rate']:g})" if r["top_rate"] and r["top"] else ""), 3, "end"),
+                         (_n(r["bot"]) + (f" ({r['bot_rate']:g})" if r["bot_rate"] and r["bot"] else ""), 3, "end"),
+                         (_n(r["total"]), 2, "end")]))
+    if len(b["rows"]) > 60:
+        body.append(t(f"... และอีก {len(b['rows']) - 60} รายการ", color="#888888"))
+    body += [{"type": "separator", "margin": "md"},
+             row([("ยอดรวม", 1, "start"), (f"{b['total']:,.2f} บาท", 1, "end")], bold=True, color="#198754")]
+    return {"type": "flex", "altText": f"บิล {b['bill_no']} ยอด {b['total']:,.2f}",
+            "contents": {"type": "bubble", "size": "mega",
+                         "header": {"type": "box", "layout": "vertical", "backgroundColor": "#111111", "contents": [
+                             t(b["lotto"], color="#f3e5ab", weight="bold", size="lg", align="center"),
+                             t("งวด " + str(b["draw"]), color="#ffffff", align="center")]},
+                         "body": {"type": "box", "layout": "vertical", "contents": body}}}
+
+
+def bill_dict(c, bill_no):
+    """โหลดบิลที่บันทึกแล้วจาก Transactions เป็น dict (สำหรับส่งให้ลูกค้า)"""
+    c.execute("SELECT id, num, type, amount, status, payout_rate, username, timestamp, customer_name, lotto_name, draw_date, "
+              "discount, net, customer_id, customer_type FROM Transactions WHERE bill_no=%s ORDER BY id", (bill_no,))
+    rs = c.fetchall()
+    if not rs:
+        return None
+    drafts = [(r[0], r[1], r[3], r[4], r[2], r[5], r[11], r[12]) for r in rs]
+    rows, tot = group_draft(drafts)
+    return {"bill_no": bill_no, "lotto": rs[0][9], "draw": rs[0][10], "ts": rs[0][7], "customer": rs[0][8], "seller": rs[0][6],
+            "rows": rows, "total": tot["amt"], "disc": tot["disc"], "net": tot["net"],
+            "customer_id": rs[0][13], "customer_type": rs[0][14]}
+
+
+def send_bill_to_customer(c, owner, bill):
+    """ส่งบิลใบแรก (ไม่มีส่วนลด) ให้ลูกค้าทุกช่องทางที่ผูกไว้  คืน (จำนวนที่ส่งสำเร็จ, [ข้อผิดพลาด])"""
+    if not bill or bill.get("customer_type") != "Customer":
+        return 0, []
+    c.execute("SELECT channel, external_id FROM ChannelLinks WHERE owner_username=%s AND customer_id=%s", (owner, bill["customer_id"]))
+    links = c.fetchall()
+    sent, errs = 0, []
+    for channel, ext in links:
+        ch = chan_get(c, owner, channel)
+        if not ch or not ch["enabled"]:
+            continue
+        if channel == "line":
+            ok, err = line_send(ch["cfg"], to=ext, messages=[bill_flex(bill)])
+        else:
+            ok, err = messenger_send(ch["cfg"], ext, bill_text(bill))
+        sent += 1 if ok else 0
+        if not ok:
+            errs.append(err)
+    return sent, errs
+
+
+HELP_TEXT = ("วิธีส่งโพย:\n14=10*10,41=10*10\n123=100*50\n(เลข=ยอดบน*ยอดล่าง คั่นด้วยคอมมาหรือขึ้นบรรทัดใหม่)\n"
+             "เลขยอดเท่ากัน: 14,41=10*10  ไม่ซื้อฝั่งใดใส่ 0 เช่น 456=0*50\n"
+             "เลือกหวย: พิมพ์ \"หวย ชื่อหวย\"   ดูเครดิต: พิมพ์ \"เครดิต\"")
+
+
+def handle_chat_message(c, owner, channel, ext_id, text):
+    """ประมวลผลข้อความจากลูกค้าในแชท  คืนข้อความตอบกลับ"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    c.execute("SELECT id, customer_id, campaign_id FROM ChannelLinks WHERE channel=%s AND external_id=%s AND owner_username=%s",
+              (channel, ext_id, owner))
+    link = c.fetchone()
+    m = re.fullmatch(r"(?:ผูก|link|bind)\s+([A-Za-z0-9]{4,10})", text, re.I)
+    if m:
+        c.execute("SELECT id, name FROM Customers WHERE LOWER(owner_username)=LOWER(%s) AND UPPER(link_code)=UPPER(%s)", (owner, m.group(1)))
+        cu = c.fetchone()
+        if not cu:
+            return "ไม่พบรหัสนี้ กรุณาตรวจสอบรหัสผูกบัญชีกับผู้ขายอีกครั้ง"
+        now = get_thai_time().strftime("%Y-%m-%d %H:%M:%S")
+        if link:
+            c.execute("UPDATE ChannelLinks SET customer_id=%s, campaign_id=NULL WHERE id=%s", (cu[0], link[0]))
+        else:
+            c.execute("INSERT INTO ChannelLinks (channel, external_id, owner_username, customer_id, created_at) VALUES (%s,%s,%s,%s,%s)",
+                      (channel, ext_id, owner, cu[0], now))
+        return f"ผูกบัญชีกับ \"{cu[1]}\" สำเร็จ ✅\n\n" + HELP_TEXT
+    if not link:
+        return "ยังไม่ได้ผูกบัญชี กรุณาพิมพ์: ผูก <รหัสลูกค้า> (ขอรหัสจากผู้ขาย)"
+    link_id, cust_id, camp_id = link
+    if re.fullmatch(r"(เครดิต|credit)", text, re.I):
+        if not credit_enabled(c, "Customer", cust_id):
+            return "บัญชีของคุณไม่ได้ใช้ระบบเครดิต"
+        return f"เครดิตคงเหลือ {credit_balance(c, 'Customer', cust_id):,.2f} บาท"
+
+    c.execute("SELECT id FROM LotteryCampaigns WHERE status='Active' ORDER BY id DESC")
+    open_camps = []
+    for (cid,) in c.fetchall():
+        camp = get_campaign(c, cid)
+        if camp and campaign_open(camp)[0]:
+            open_camps.append(camp)
+    m = re.match(r"(?:หวย|lotto)\s+(.+)", text, re.I)
+    if m:
+        kw = m.group(1).strip().lower()
+        hit = [k for k in open_camps if kw in (k["lotto_name"] or "").lower()]
+        if len(hit) == 1:
+            c.execute("UPDATE ChannelLinks SET campaign_id=%s WHERE id=%s", (hit[0]["id"], link_id))
+            return f"เลือกหวย: {hit[0]['lotto_name']} งวด {hit[0]['draw_date']} ✅ ส่งโพยได้เลย"
+        if not hit:
+            return "ไม่พบหวยที่เปิดรับตามชื่อนี้\nหวยที่เปิดรับ:\n" + "\n".join("• " + k["lotto_name"] for k in open_camps[:15])
+        return "พบหลายหวย กรุณาระบุให้ชัดขึ้น:\n" + "\n".join("• " + k["lotto_name"] for k in hit[:15])
+
+    entries, errors = parse_quick(text)
+    if not entries:
+        return ("อ่านโพยไม่ได้\n" + "\n".join(errors[:5]) + "\n\n" if errors else "") + HELP_TEXT
+    camp = next((k for k in open_camps if k["id"] == camp_id), None)
+    if not camp:
+        if len(open_camps) == 1:
+            camp = open_camps[0]
+        elif not open_camps:
+            return "ขณะนี้ไม่มีหวยที่เปิดรับ"
+        else:
+            return "มีหวยเปิดรับหลายรายการ กรุณาเลือกก่อน พิมพ์: หวย <ชื่อหวย>\n" + "\n".join("• " + k["lotto_name"] for k in open_camps[:15])
+    rates, _ = get_rates(c, str(cust_id), camp["lotto_name"])
+    if not rates:
+        return "ยังไม่ได้ตั้งเรตของคุณสำหรับหวยนี้ กรุณาติดต่อผู้ขาย"
+    blocked = get_blocked_map(c, camp["lotto_name"], camp["draw_date"])
+    rows, rejected, invalid = make_draft_rows(rates, blocked, entries, owner, "Customer", cust_id, camp)
+    if rows:
+        c.executemany("INSERT INTO TempDraft (username, customer_id, customer_type, num, amt_teng, type, payout_rate, discount, net, "
+                      "status, lotto_name, draw_date) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+    total = sum(r[4] for r in rows)
+    msg = [f"รับโพยแล้ว {len(rows)} รายการ ยอด {total:,.2f} บาท\n{camp['lotto_name']} งวด {camp['draw_date']}\nรอผู้ขายตรวจและออกบิลให้ค่ะ"] if rows else ["ไม่มีรายการที่บันทึกได้"]
+    if rejected:
+        msg.append("เลขปิดรับ: " + ", ".join(rejected[:30]))
+    if errors:
+        msg.append("อ่านไม่ได้: " + "; ".join(errors[:3]))
+    return "\n".join(msg)

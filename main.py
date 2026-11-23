@@ -325,6 +325,7 @@ LAYOUT = """
             <a href="/buy?user={{ username }}&draw={{ draw_date|urlencode }}">🛒 บันทึกโพย</a>
             <a href="/live-sales?user={{ username }}&draw={{ draw_date|urlencode }}">📈 ยอดขายสด</a>
             <a href="/risk-control?user={{ username }}&draw={{ draw_date|urlencode }}">🛡️ ควบคุมความเสี่ยง</a>
+            <a href="/credits?user={{ username }}&draw={{ draw_date|urlencode }}">💳 เครดิต</a>
             {% if role == 'Admin' %}
             <a href="/audit-all?user={{ username }}&draw={{ draw_date|urlencode }}">🔍 ตรวจสอบทั้งหมด</a>
             <a href="/results?user={{ username }}&draw={{ draw_date|urlencode }}">🏆 ออกผลรางวัล</a>
@@ -1786,6 +1787,12 @@ def confirm_bill(user: str = Form(...), draw: str = Form(...), customer_info: st
             return back_to_buy(user, draw, customer_info, msg="มีเลขที่เพิ่งปิดรับ กรุณาลบก่อน: " + ", ".join(closed_now))
 
         bill_no = common.generate_bill_no(c, lotto_name, draw_clean, c_type, int(c_id))
+        acct = common.credit_account(c, c_type, int(c_id), common.get_user(c, user))
+        if acct:
+            ok_c, why_c = common.credit_charge(c, acct, sum(float(d[6] or 0) for d in drafts), bill_no, user)
+            if not ok_c:
+                conn.rollback()
+                return back_to_buy(user, draw, customer_info, msg=why_c)
         ts = get_thai_time().strftime("%d/%m/%Y %H:%M:%S")
         bill_items, tx_rows = [], []
         total_amt = total_disc = total_net = 0.0
@@ -2411,6 +2418,33 @@ def cancel_bill_post(user: str = Form(...), draw: str = Form(...), bill_no: str 
             ok, text = common.cancel_bill(c, me, bill_no, reason)
         q = {"user": user, "draw": draw, ("msg" if ok else "error"): text}
         return RedirectResponse(url="/cancel-bills?" + urlencode(q), status_code=303)
+    except Exception as e: return route_error(e)
+
+
+@app.get("/credits", response_class=HTMLResponse)
+def credits_page(user: str, draw: str = "ระบบเครดิต", msg: str = None, error: str = None):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            inner = common.render_credits(c, me, "/credit-action", {"user": user, "draw": draw})
+        return Template(LAYOUT).render(username=user, role=me["role"], draw_date=draw, content=inner, msg=msg, error=error, current_close_time=None)
+    except Exception as e: return route_error(e)
+
+
+@app.post("/credit-action")
+def credit_action(user: str = Form(...), draw: str = Form("ระบบเครดิต"), target: str = Form(...), op: str = Form(...),
+                  amount: float = Form(0), note: str = Form("")):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            ok, text = common.credit_adjust(c, me, target, op, amount, note)
+        return RedirectResponse(url="/credits?" + urlencode({"user": user, "draw": draw, ("msg" if ok else "error"): text}), status_code=303)
     except Exception as e: return route_error(e)
 
 
