@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Form, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse, Response
+from starlette.concurrency import run_in_threadpool
 from jinja2 import Template as _JinjaTemplate
 import psycopg2
 from datetime import datetime, timedelta
@@ -57,6 +58,7 @@ def route_error(e=None):
 # -> ต่อให้ใครแก้ URL เป็น ?user=admin ระบบก็ยังเห็นเป็นคนที่ล็อกอินจริง
 
 _PUBLIC_PATHS = {"/", "/login", "/logout"}
+_PUBLIC_PREFIXES = ("/webhook/", "/bill-img/")      # เรียกจากแพลตฟอร์มแชท/รูปบิล — ตรวจด้วยลายเซ็น/โทเค็นของตัวเอง
 _ADMIN_ONLY = {
     "/create-campaign", "/update-campaign", "/toggle-campaign",
     "/blocked-numbers", "/save-blocked", "/update-blocked", "/delete-blocked", "/clear-blocked",
@@ -112,7 +114,7 @@ class SessionAuthMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["path"] in _PUBLIC_PATHS:
+        if scope["type"] != "http" or scope["path"] in _PUBLIC_PATHS or scope["path"].startswith(_PUBLIC_PREFIXES):
             return await self.app(scope, receive, send)
         path, method = scope["path"], scope["method"]
 
@@ -326,6 +328,7 @@ LAYOUT = """
             <a href="/live-sales?user={{ username }}&draw={{ draw_date|urlencode }}">📈 ยอดขายสด</a>
             <a href="/risk-control?user={{ username }}&draw={{ draw_date|urlencode }}">🛡️ ควบคุมความเสี่ยง</a>
             <a href="/credits?user={{ username }}&draw={{ draw_date|urlencode }}">💳 เครดิต</a>
+            {% if role in ['Admin', 'Master Agent', 'Agent'] %}<a href="/integrations?user={{ username }}&draw={{ draw_date|urlencode }}">🔗 เชื่อมต่อแชท</a>{% endif %}
             {% if role == 'Admin' %}
             <a href="/audit-all?user={{ username }}&draw={{ draw_date|urlencode }}">🔍 ตรวจสอบทั้งหมด</a>
             <a href="/results?user={{ username }}&draw={{ draw_date|urlencode }}">🏆 ออกผลรางวัล</a>
@@ -656,11 +659,19 @@ BLOCKED_TEMPLATE = """
 </div>
 """
 
-BUY_CONTENT = """
+BUY_CONTENT = r"""<style>
+ .quick-btn{background:#0d6efd;color:#fff;font-weight:bold;border:none;padding:8px 15px;border-radius:6px;flex-grow:1;font-size:.9rem}
+ .preview-box{background:#ccfeff;border:2px solid #0dcaf0;padding:10px;border-radius:6px;font-family:monospace;font-weight:bold;margin-bottom:12px;min-height:45px;display:flex;align-items:center;flex-wrap:wrap;gap:5px}
+ .bill-card{background:#fff;border:2px solid #222;border-radius:8px;padding:12px;font-size:.78rem;height:100%}
+ .bill-head{background:#111;color:#f3e5ab;text-align:center;font-weight:bold;font-size:1.1rem;padding:4px;border-radius:4px}
+ .bill-row{display:flex;justify-content:space-between;gap:8px;margin:2px 0}
+ .bill-t{width:100%;margin-top:6px;border-collapse:collapse}.bill-t th{background:#eee;border:1px solid #bbb;text-align:center;padding:2px}
+ .bill-t td{border:1px solid #ddd;text-align:center;padding:2px}.bill-net td{background:#d1e7dd;font-weight:bold;font-size:.95rem}
+</style>
 <div class="row">
     <div class="col-lg-8">
         <div class="mb-2 text-end"><a class="btn btn-outline-danger btn-sm fw-bold" href="/cancel-bills?user={{ username }}&draw={{ draw_date|urlencode }}">🗑️ ยกเลิกบิล</a></div>
-        <div class="card shadow p-4 mb-4">
+        <div class="card shadow p-4 mb-3">
             <form id="custForm" method="GET" action="/buy">
                 <input type="hidden" name="user" value="{{ username }}">
                 <input type="hidden" name="draw" value="{{ draw_date }}">
@@ -674,73 +685,112 @@ BUY_CONTENT = """
                 </div>
             </form>
 
-            <form method="POST" action="/add-draft">
+            <div class="fw-bold text-dark small mb-1">ฟังก์ชั่นเสริม:</div>
+            <div class="d-flex gap-2 mb-2 flex-wrap">
+                <button type="button" class="quick-btn" onclick="apply6Box()">6กลับ</button>
+                <button type="button" class="quick-btn" onclick="apply19Door()">รูด19ประตู</button>
+                <button type="button" class="quick-btn" onclick="applyFrontRoot()">รูดหน้า</button>
+                <button type="button" class="quick-btn" onclick="applyBackRoot()">รูดหลัง</button>
+            </div>
+            <div class="preview-box" id="previewContent"><span class="text-muted small">preview:- (พิมพ์เลข 1 ตัวแล้วกดรูด หรือเลข 2-3 ตัวแล้วกด 6กลับ/สลับเลข)</span></div>
+
+            <form method="POST" action="/add-draft" onreset="resetPreview()">
                 <input type="hidden" name="user" value="{{ username }}">
                 <input type="hidden" name="draw" value="{{ draw_date }}">
                 <input type="hidden" name="customer_info" value="{{ selected_target_raw }}">
-                
                 <div class="mb-2">
-                    <label class="form-label fw-bold text-dark mb-1">เลข &nbsp;=&nbsp; บน/วิ่งบน &nbsp;&times;&nbsp; โต๊ด/ล่าง/วิ่งล่าง</label>
+                    <label class="form-label fw-bold text-dark mb-1">เลข &nbsp;=&nbsp; บน/3ตัวตรง &nbsp;&times;&nbsp; ล่าง/3ตัวโต๊ด</label>
                     <div class="row g-2 align-items-center mb-2">
-                        <div class="col-md-3"><input type="text" name="col_num" class="form-control" placeholder="พิมพ์เลข..."></div>
+                        <div class="col-md-3"><input type="text" id="mainNumInput" name="col_num" class="form-control" placeholder="พิมพ์เลข... (คั่นหลายเลขด้วย ,)" oninput="refreshPreview()" autocomplete="off"></div>
                         <div class="col-auto fw-bold fs-5 text-dark">=</div>
-                        <div class="col-md-4"><input type="number" step="any" name="col_teng" class="form-control" placeholder="ยอดเงิน (บน)"></div>
+                        <div class="col-md-4"><input type="number" step="any" min="0" id="topAmtInput" name="col_teng" class="form-control" placeholder="ยอดเงิน (บน)" oninput="refreshPreview()"></div>
                         <div class="col-auto fw-bold fs-5 text-dark">&times;</div>
-                        <div class="col-md-4"><input type="number" step="any" name="col_tod" class="form-control" placeholder="ยอดเงิน (ล่าง)"></div>
+                        <div class="col-md-4"><input type="number" step="any" min="0" id="botAmtInput" name="col_tod" class="form-control" placeholder="ยอดเงิน (ล่าง)" oninput="refreshPreview()"></div>
                     </div>
                 </div>
-
                 <div class="mb-3">
                     <label class="form-label fw-bold text-dark small">คีย์ต่อเนื่อง ใช้ "," คั่น (รวดเร็วไม่หน่วง)</label>
                     <input type="text" name="raw_input" class="form-control" placeholder="พิมพ์เลขและราคา...">
                 </div>
-                <button type="submit" class="btn btn-success btn-lg w-100 fw-bold"><i class="fa-solid fa-cart-plus"></i> บันทึกลงรายการร่าง</button>
+                <div class="d-flex gap-2">
+                    <button type="reset" class="btn btn-danger fw-bold px-4">ยกเลิก</button>
+                    <button type="submit" class="btn btn-success fw-bold flex-grow-1">➕ บันทึกลงรายการร่าง</button>
+                </div>
             </form>
         </div>
 
+        <form method="POST" action="/quick-add" class="card shadow p-3 mb-3 border-warning">
+            <input type="hidden" name="user" value="{{ username }}">
+            <input type="hidden" name="draw" value="{{ draw_date }}">
+            <input type="hidden" name="customer_info" value="{{ selected_target_raw }}">
+            <label class="form-label small fw-bold mb-1">⚡ คีย์ด่วน / วางโพย <span class="text-muted fw-normal">— เลข=บน*ล่าง คั่นด้วย , หรือขึ้นบรรทัดใหม่ · เลขยอดเท่ากัน: 14,41=10*10 · ไม่ซื้อฝั่งใดใส่ 0 เช่น 456=0*50</span></label>
+            <textarea id="quickText" name="quick_text" class="form-control" rows="3" style="resize:vertical;overflow:hidden;min-height:78px;font-family:monospace"
+              placeholder="14=10*10,41=10*10,45=10*20,123=100*50&#10;หรือ&#10;14,41=10*10&#10;123=100*50&#10;456=0*50" oninput="autoGrow(this)" required></textarea>
+            <div id="quickPreview" class="small text-muted mt-1"></div>
+            <button class="btn btn-warning fw-bold mt-2 px-4">⚡ เพิ่มเข้าโพยร่าง</button>
+        </form>
+
+        {% macro billcard(with_disc) %}
+        <div class="bill-card">
+          <div class="bill-head">{{ lotto_name_for_bill }}</div>
+          <div class="text-center small mb-1">งวด {{ draw_date_clean }}</div>
+          <div class="bill-row"><span>{{ preview_time }}</span><span>เลขที่บิล {{ preview_bill_no }}</span></div>
+          <div class="bill-row"><span>ลูกค้า: <b>{{ customer_name_for_bill }}</b></span><span>ผู้ขาย: <b>{{ username }}</b></span></div>
+          <table class="bill-t">
+            <thead><tr><th>ตัวเลข</th><th>บน/3ตรง</th><th>Rate</th><th>ล่าง/โต๊ด</th><th>Rate</th><th>รวม</th>{% if with_disc %}<th>ส่วนลด</th>{% endif %}</tr></thead>
+            <tbody>
+            {% for r in draft_rows %}
+              <tr><td><b>{{ r.num }}</b></td>
+              <td>{{ '{:,.2f}'.format(r.top) if r.top else '-' }}</td><td>{% if r.top and r.top_rate is not none %}({{ '{:g}'.format(r.top_rate) }}){% endif %}</td>
+              <td>{{ '{:,.2f}'.format(r.bot) if r.bot else '-' }}</td><td>{% if r.bot and r.bot_rate is not none %}({{ '{:g}'.format(r.bot_rate) }}){% endif %}</td>
+              <td><b>{{ '{:,.2f}'.format(r.total) }}</b></td>{% if with_disc %}<td class="text-danger">{{ '{:,.2f}'.format(r.disc) }}</td>{% endif %}</tr>
+            {% endfor %}
+            </tbody>
+            <tfoot>
+              <tr><td colspan="5" class="text-end fw-bold">ยอดรวม</td><td class="fw-bold">{{ '{:,.2f}'.format(dtot.amt) }}</td>{% if with_disc %}<td class="text-danger fw-bold">{{ '{:,.2f}'.format(dtot.disc) }}</td>{% endif %}</tr>
+              {% if with_disc %}<tr class="bill-net"><td colspan="5" class="text-end">ยอดสุทธิหลังหักส่วนลด</td><td colspan="2">{{ '{:,.2f}'.format(dtot.net) }}</td></tr>{% endif %}
+            </tfoot>
+          </table>
+          <div class="text-center small text-muted mt-2">{{ 'บิลสำหรับผู้ขาย (มีส่วนลด)' if with_disc else 'บิลสำหรับลูกค้า' }}</div>
+        </div>
+        {% endmacro %}
+
         <div class="card shadow p-4 mb-4">
-            <h4 class="text-primary mb-3 fw-bold">📋 1. รายการร่าง (รอยืนยันโพย)</h4>
+            <h4 class="text-primary mb-3 fw-bold text-center">📋 โพยร่าง (รอออกบิล)</h4>
             <div class="table-responsive">
-                <table class="table table-striped table-bordered text-center align-middle">
-                    <thead class="table-dark">
-                        <tr><th>เลข</th><th>ประเภท</th><th>ยอดซื้อ</th><th>อัตราจ่าย</th><th>ส่วนลด</th><th>ยอดสุทธิ</th><th>สถานะอั้น</th><th>จัดการ</th></tr>
-                    </thead>
+                <table class="table table-sm table-bordered text-center align-middle" style="font-size:.9rem">
+                    <thead class="table-dark"><tr><th>ตัวเลข</th><th>บน/3ตัวตรง</th><th>Rate</th><th>ล่าง/3ตัวโต๊ด</th><th>Rate</th><th>รวม</th><th></th></tr></thead>
                     <tbody>
-                        {% for d in drafts %}
-                        <tr>
-                            <td><b>{{ d[1] }}</b></td><td>{{ d[4] }}</td><td>{{ "{:,.2f}".format(d[2] | float) }}</td><td><span class="badge bg-success">{{ d[5] }}</span></td>
-                            <td class="text-danger">{{ "{:,.2f}".format(d[6] | float) }}</td><td class="text-success fw-bold">{{ "{:,.2f}".format(d[7] | float) }}</td>
-                            <td><span class="badge {% if d[3] == 'ปกติ' %}bg-danger{% else %}bg-warning text-dark{% endif %}">{{ d[3] }}</span></td>
-                            <td>
-                                <a href="/edit-draft-item?id={{ d[0] }}&user={{ username }}&draw={{ draw_date|urlencode }}&selected={{ selected_target_raw|urlencode }}" class="text-decoration-none fw-bold me-1">แก้ไข</a>
-                                <a href="/delete-draft-item?id={{ d[0] }}&user={{ username }}&draw={{ draw_date|urlencode }}&selected={{ selected_target_raw|urlencode }}" class="text-danger text-decoration-none fw-bold">ลบ</a>
-                            </td>
-                        </tr>
-                        {% else %}
-                        <tr><td colspan="8" class="text-muted">ยังไม่มีรายการในร่าง</td></tr>
-                        {% endfor %}
+                    {% for r in draft_rows %}
+                      <tr>
+                        <td><b class="fs-6">{{ r.num }}</b>{% if r.status != 'ปกติ' %} <span class="badge bg-warning text-dark">{{ r.status }}</span>{% endif %}</td>
+                        <td>{{ '{:,.2f}'.format(r.top) if r.top else '-' }}</td>
+                        <td class="text-muted">{% if r.top and r.top_rate is not none %}({{ '{:g}'.format(r.top_rate) }}){% endif %}</td>
+                        <td>{{ '{:,.2f}'.format(r.bot) if r.bot else '-' }}</td>
+                        <td class="text-muted">{% if r.bot and r.bot_rate is not none %}({{ '{:g}'.format(r.bot_rate) }}){% endif %}</td>
+                        <td class="fw-bold text-success">{{ '{:,.2f}'.format(r.total) }}</td>
+                        <td><form method="POST" action="/delete-draft-group" class="m-0">
+                          <input type="hidden" name="user" value="{{ username }}"><input type="hidden" name="draw" value="{{ draw_date }}">
+                          <input type="hidden" name="customer_info" value="{{ selected_target_raw }}"><input type="hidden" name="item_ids" value="{{ r.ids_csv }}">
+                          <button class="btn btn-link btn-sm text-danger p-0 fw-bold">ลบ</button></form></td>
+                      </tr>
+                    {% else %}
+                      <tr><td colspan="7" class="text-muted py-3">ยังไม่มีรายการโพยร่าง</td></tr>
+                    {% endfor %}
                     </tbody>
+                    {% if draft_rows %}
+                    <tfoot class="table-light fw-bold"><tr>
+                      <td class="text-end">รวม</td><td>{{ '{:,.2f}'.format(dtot.top) }}</td><td></td><td>{{ '{:,.2f}'.format(dtot.bot) }}</td><td></td>
+                      <td class="text-success fs-6">{{ '{:,.2f}'.format(dtot.amt) }}</td><td></td>
+                    </tr></tfoot>
+                    {% endif %}
                 </table>
             </div>
-
-            {% if drafts %}
-            <div class="card bg-light p-3 mb-3 border">
-                <div class="row text-center fw-bold text-dark">
-                    <div class="col">ยอดซื้อรวม: ฿{{ "{:,.2f}".format(draft_totals.sum_amt) }}</div>
-                    <div class="col text-danger">ส่วนลดรวม: ฿{{ "{:,.2f}".format(draft_totals.sum_disc) }}</div>
-                    <div class="col text-primary">ยอดสุทธิที่ต้องชำระ: ฿{{ "{:,.2f}".format(draft_totals.sum_net) }}</div>
-                </div>
+            {% if credit %}<div class="alert {{ 'alert-warning' if credit.balance < dtot.net else 'alert-info' }} py-1 small mb-2">💳 เครดิต{{ credit.who }} ({{ credit.name }}) คงเหลือ <b>{{ '{:,.2f}'.format(credit.balance) }}</b> บาท{% if credit.balance < dtot.net %} — <b>ไม่พอสำหรับยอดสุทธิ {{ '{:,.2f}'.format(dtot.net) }}</b>{% endif %}</div>{% endif %}
+            <div class="d-flex gap-2 mt-2">
+                <button type="button" class="btn btn-primary flex-grow-1 fw-bold" data-bs-toggle="modal" data-bs-target="#billModal" {% if not draft_rows %}disabled{% endif %}>💾 บันทึก/ออกบิล</button>
+                <a href="/clear-draft?user={{ username }}&draw={{ draw_date|urlencode }}&selected={{ selected_target_raw|urlencode }}" class="btn btn-danger fw-bold px-4 {% if not draft_rows %}disabled{% endif %}" onclick="return confirm('ยืนยันล้างโพยทั้งหมด?')">🗑️ ล้างโพย</a>
             </div>
-            
-            <div class="row g-2">
-                <div class="col-md-6">
-                    <button type="button" class="btn btn-primary btn-lg w-100 fw-bold" data-bs-toggle="modal" data-bs-target="#billModal"><i class="fa-solid fa-check"></i> ยืนยันโพย (เปิดหน้าต่างบิล)</button>
-                </div>
-                <div class="col-md-6">
-                    <a href="/clear-draft?user={{ username }}&draw={{ draw_date|urlencode }}&selected={{ selected_target_raw|urlencode }}" class="btn btn-outline-danger btn-lg w-100 fw-bold">ยกเลิกรายการร่างทั้งหมด</a>
-                </div>
-            </div>
-            {% endif %}
         </div>
     </div>
 
@@ -774,54 +824,70 @@ BUY_CONTENT = """
     </div>
 </div>
 
-<div class="modal fade" id="billModal" tabindex="-1" aria-labelledby="billModalLabel" aria-hidden="true">
-  <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
-    <div class="modal-content border border-warning shadow-lg">
-      <div class="modal-header bg-dark text-white">
-        <h5 class="modal-title fw-bold text-warning" id="billModalLabel"><i class="fa-solid fa-receipt"></i> ตรวจสอบรายละเอียดบิล</h5>
-        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+<div class="modal fade" id="billModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">
+    <div class="modal-header py-2"><h5 class="modal-title fw-bold">🧾 ตรวจสอบบิลก่อนบันทึก</h5>
+      <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body" style="background:#f1f1f1">
+      <div class="row g-3">
+        <div class="col-lg-6">{{ billcard(false) }}</div>
+        <div class="col-lg-6">{{ billcard(true) }}</div>
       </div>
-      <div class="modal-body p-4 bg-white">
-        <div class="card p-3 mb-3 bg-light border-secondary border-2" style="border-style: dashed !important;">
-            <div class="row text-start text-dark" style="font-size: 0.95rem;">
-                <div class="col-12 mb-1"><strong>เลขที่บิล:</strong> <span class="text-primary fw-bold">{{ preview_bill_no }}</span></div>
-                <div class="col-12 mb-1"><strong>วันที่ทำรายการ:</strong> {{ preview_time }}</div>
-                <div class="col-12 mb-1"><strong>งวดหวย:</strong> {{ lotto_name_for_bill }} <span class="text-muted">(งวด: {{ draw_date_clean }})</span></div>
-                <div class="col-12"><strong>ลูกค้า:</strong> {{ customer_name_for_bill }}</div>
-            </div>
-        </div>
-        <table class="table table-sm table-bordered text-center align-middle" style="font-size: 0.9rem;">
-            <thead class="table-secondary">
-                <tr><th>หมายเลข</th><th>ประเภท</th><th>ยอดซื้อ</th><th>สุทธิ</th></tr>
-            </thead>
-            <tbody>
-                {% for d in drafts %}
-                <tr>
-                    <td><b>{{ d[1] }}</b></td><td>{{ d[4] }}</td><td>{{ "{:,.0f}".format(d[2] | float) }}</td><td class="fw-bold text-success">{{ "{:,.0f}".format(d[7] | float) }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        <div class="card bg-white p-2 mt-2 border">
-            <div class="d-flex justify-content-between"><span class="text-muted">ยอดรวม:</span> <b>฿{{ "{:,.2f}".format(draft_totals.sum_amt) }}</b></div>
-            <div class="d-flex justify-content-between"><span class="text-danger">ส่วนลด:</span> <b class="text-danger">฿{{ "{:,.2f}".format(draft_totals.sum_disc) }}</b></div>
-            <hr class="my-1">
-            <div class="d-flex justify-content-between fs-5"><span class="text-primary fw-bold">ยอดสุทธิ:</span> <b class="text-primary">฿{{ "{:,.2f}".format(draft_totals.sum_net) }}</b></div>
-        </div>
-      </div>
-      <div class="modal-footer d-flex justify-content-between bg-dark">
-        <button type="button" class="btn btn-outline-light fw-bold" data-bs-dismiss="modal">❌ กลับไปแก้ไข</button>
-        <form method="POST" action="/confirm-bill">
-            <input type="hidden" name="user" value="{{ username }}">
-            <input type="hidden" name="draw" value="{{ draw_date }}">
-            <input type="hidden" name="customer_info" value="{{ selected_target_raw }}">
-            <input type="hidden" name="lotto_name" value="{{ lotto_name_for_bill }}">
-            <button type="submit" class="btn btn-warning fw-bold px-4">💾 ยืนยันและพิมพ์บิล</button>
-        </form>
-      </div>
+      <div class="small text-muted mt-2">เลขที่บิลและเวลาเป็นค่าตัวอย่าง ระบบจะออกเลขจริงเมื่อกดบันทึก · บิลใบที่ 1 (ไม่มีส่วนลด) จะถูกส่งเป็นรูปภาพให้ลูกค้าทางแชทที่ผูกไว้</div>
+      {% if credit and credit.balance < dtot.net %}<div class="alert alert-danger mt-2 mb-0 fw-bold">❌ เครดิตไม่พอ ไม่สามารถบันทึกบิลได้ (คงเหลือ {{ '{:,.2f}'.format(credit.balance) }} / ต้องใช้ {{ '{:,.2f}'.format(dtot.net) }})</div>{% endif %}
     </div>
-  </div>
+    <div class="modal-footer justify-content-center gap-2">
+      <form method="POST" action="/confirm-bill" class="m-0" onsubmit="this.querySelector('button').disabled=true;">
+        <input type="hidden" name="user" value="{{ username }}">
+        <input type="hidden" name="draw" value="{{ draw_date }}">
+        <input type="hidden" name="customer_info" value="{{ selected_target_raw }}">
+        <input type="hidden" name="lotto_name" value="{{ lotto_name_for_bill }}">
+        <button class="btn btn-success fw-bold px-5" {% if credit and credit.balance < dtot.net %}disabled{% endif %}>✅ บันทึกบิล/ส่งบิล</button>
+      </form>
+      <button type="button" class="btn btn-outline-danger fw-bold px-5" data-bs-dismiss="modal">✖ ยกเลิกบิล</button>
+    </div>
+  </div></div>
 </div>
+<script>
+var baseNum='';
+function val(id){return document.getElementById(id).value;}
+function autoGrow(el){ el.style.height='auto'; el.style.height=Math.max(78,el.scrollHeight+2)+'px'; quickPreview(el.value); }
+function quickPreview(t){
+  var box=document.getElementById('quickPreview'); if(!box) return;
+  var s=t.replace(/＝/g,'=').replace(/\s*=\s*/g,'=').replace(/\s*\*\s*/g,'*').replace(/(\d)\s*[xX×]\s*(\d)/g,'$1*$2');
+  var toks=s.split(/[,\s;]+/).filter(Boolean), pend=[], n=0, tot=0, bad=0;
+  toks.forEach(function(k){
+    if(k.indexOf('=')<0){pend.push(k);return;}
+    var p=k.split('='), l=p[0], r=p[1]||''; if(l) pend.push(l);
+    var m=r.match(/^(\d+(?:\.\d+)?)(?:\*(\d+(?:\.\d+)?))?$/);
+    if(!m||!pend.length){bad++;pend=[];return;}
+    var amt=parseFloat(m[1])+parseFloat(m[2]||0);
+    pend.forEach(function(x){ if(/^\d{1,3}$/.test(x)&&amt>0){n++;tot+=amt;}else bad++; }); pend=[];
+  });
+  bad+=pend.length;
+  box.textContent=t.trim()?('อ่านได้ '+n+' เลข ยอดรวม '+tot.toLocaleString('th-TH',{minimumFractionDigits:2})+' บาท'+(bad?' · ⚠️ มี '+bad+' จุดที่อ่านไม่ได้':'')):'';
+}
+function setPreview(nums){
+  var box=document.getElementById('previewContent'); if(!box) return; box.textContent='';
+  var s=document.createElement('span'); s.className='text-primary fw-bold'; s.style.wordBreak='break-all'; s.textContent=nums||'-'; box.appendChild(s);
+  var d=document.createElement('div'); d.className='w-100 mt-1';
+  d.textContent='➡️ บน '+(val('topAmtInput')||'0')+' | ล่าง '+(val('botAmtInput')||'0'); box.appendChild(d);
+}
+function resetPreview(){ baseNum=''; var box=document.getElementById('previewContent'); box.textContent='preview:-'; }
+function refreshPreview(){ baseNum=val('mainNumInput'); setPreview(baseNum); }
+function generated(nums){ document.getElementById('mainNumInput').value=nums; setPreview(nums); }
+function apply6Box(){
+  var n=baseNum.trim(); if(!/^[0-9]{2,3}$/.test(n)){alert('กรุณากรอกตัวเลข 2 หลัก หรือ 3 หลัก');return;}
+  var perms=new Set(), a=n.split(''), len=a.length;
+  (function p(l){ if(l===len-1){perms.add(a.join(''));return;} for(var i=l;i<len;i++){[a[l],a[i]]=[a[i],a[l]];p(l+1);[a[l],a[i]]=[a[i],a[l]];} })(0);
+  generated(Array.from(perms).join(','));
+}
+function digit1(){ var d=baseNum.trim(); if(!/^[0-9]$/.test(d)){alert('กรุณากรอกตัวเลข 1 หลัก');return null;} return d; }
+function apply19Door(){ var d=digit1(); if(d===null) return; var o=[];
+  for(var i=0;i<=9;i++){var a=d+i,b=i+d; if(o.indexOf(a)<0)o.push(a); if(o.indexOf(b)<0)o.push(b);} generated(o.join(',')); }
+function applyFrontRoot(){ var d=digit1(); if(d===null) return; var o=[]; for(var i=0;i<=9;i++)o.push(d+i); generated(o.join(',')); }
+function applyBackRoot(){ var d=digit1(); if(d===null) return; var o=[]; for(var i=0;i<=9;i++)o.push(i+d); generated(o.join(',')); }
+</script>
 """
 
 BILL_PRINT_TEMPLATE = """
@@ -850,6 +916,7 @@ BILL_PRINT_TEMPLATE = """
     </style>
 </head>
 <body>
+    {% if chat_note %}<div class="alert alert-info text-center fw-bold m-2 no-print">{{ chat_note }}</div>{% endif %}
     <div class="slip-container">
         <div class="text-center fw-bold fs-5">{{ lotto_title }}</div>
         <div class="text-center small">งวดวันที่: {{ draw_date }}</div>
@@ -1567,67 +1634,88 @@ def buy_page(user: str, draw: str, selected: str = None, msg: str = None):
         if role == 'Admin': c.execute("SELECT * FROM Transactions WHERE (draw_date = %s OR draw_date ILIKE %s) ORDER BY id DESC LIMIT 15", (draw_clean, f"%{draw_clean}%"))
         else: c.execute("SELECT * FROM Transactions WHERE ((draw_date = %s OR draw_date ILIKE %s) AND username = %s) ORDER BY id DESC LIMIT 15", (draw_clean, f"%{draw_clean}%", user))
         recent_transactions = c.fetchall()
+        draft_rows, dtot = common.group_draft(drafts)
+        credit = None
+        if c_id:
+            acct = common.credit_account(c, c_type, int(c_id), me_row)
+            if acct:
+                credit = {"balance": common.credit_balance(c, acct[0], acct[1]), "name": common.get_target_name(c, acct[0], acct[1]) or "",
+                          "who": "ของผู้ซื้อ" if acct == (c_type, int(c_id)) else "ของคุณ"}
         conn.close()
         
         b_closed, b_3d, b_2d = get_blocked_display_data(draw_clean, lotto_name_for_bill)
         close_t = get_current_campaign_close_time(draw_clean, lotto_name_for_bill)
         curr_time = get_thai_time().strftime("%d/%m/%Y %H:%M")
-        content = Template(BUY_CONTENT).render(username=user, draw_date=draw, draw_date_clean=draw_clean, customers=all_targets, selected_target_raw=selected, drafts=drafts, draft_totals={"sum_amt": sum_amt, "sum_disc": sum_disc, "sum_net": sum_net}, block_closed=b_closed, block_3d=b_3d, block_2d=b_2d, recent_transactions=recent_transactions, lotto_name_for_bill=lotto_name_for_bill, customer_name_for_bill=customer_name_for_bill, preview_bill_no=preview_bill_no, preview_time=curr_time)
+        content = Template(BUY_CONTENT).render(username=user, draw_date=draw, draw_date_clean=draw_clean, customers=all_targets, selected_target_raw=selected, drafts=drafts, draft_totals={"sum_amt": sum_amt, "sum_disc": sum_disc, "sum_net": sum_net}, block_closed=b_closed, block_3d=b_3d, block_2d=b_2d, recent_transactions=recent_transactions, lotto_name_for_bill=lotto_name_for_bill, customer_name_for_bill=customer_name_for_bill, preview_bill_no=preview_bill_no, preview_time=curr_time, draft_rows=draft_rows, dtot=dtot, credit=credit)
         return Template(LAYOUT).render(username=user, role=role, draw_date=draw, content=content, msg=msg, current_close_time=close_t)
     except Exception as e: return route_error(e)
+
+MAX_ENTRIES = 3000
+
+
+def _draft_prepare(c, user, draw, customer_info):
+    """ตรวจสิทธิ์/งวด/เรต  คืน (ctx, None) หรือ (None, response)"""
+    sel = parse_selected(customer_info)
+    if not sel:
+        return None, back_to_buy(user, draw, "", msg="ไม่ได้เลือกลูกค้า / สายงาน")
+    c_id, _name, c_type = sel
+    lotto_name, draw_clean = split_draw(draw)
+    role = (common.get_user(c, user) or {}).get("role", "Member")
+    if not can_use_target(c, user, role, c_id, c_type):
+        return None, back_to_buy(user, draw, customer_info, msg="คุณไม่มีสิทธิ์บันทึกโพยให้ผู้ซื้อรายนี้")
+    if not lotto_name:
+        c.execute("SELECT lotto_name FROM LotteryCampaigns WHERE draw_date=%s OR draw_date ILIKE %s ORDER BY id DESC LIMIT 1",
+                  (draw_clean, f"%{common.like_escape(draw_clean)}%"))
+        r = c.fetchone()
+        lotto_name = r[0] if r else ""
+    c.execute("SELECT id, lotto_name, draw_date, status, close_time, open_time FROM LotteryCampaigns WHERE lotto_name=%s AND (draw_date=%s OR draw_date ILIKE %s) "
+              "ORDER BY id DESC LIMIT 1", (lotto_name, draw_clean, f"%{common.like_escape(draw_clean)}%"))
+    cr = c.fetchone()
+    camp = {"id": cr[0], "lotto_name": cr[1], "draw_date": cr[2], "status": cr[3], "close_time": cr[4], "open_time": cr[5]} if cr else \
+           {"id": None, "lotto_name": lotto_name, "draw_date": draw_clean, "status": "Active", "close_time": None, "open_time": None}
+    if cr:
+        ok, reason = common.campaign_open(camp)
+        if not ok:
+            return None, back_to_buy(user, draw, customer_info, msg=reason)
+    camp["lotto_name"], camp["draw_date"] = lotto_name, draw_clean      # ใช้ค่าเดียวกับที่หน้าบันทึกโพยใช้ค้นโพยร่าง
+    rates, _src = common.get_rates(c, common.target_key(c_type, int(c_id)), lotto_name)
+    if not rates:
+        return None, back_to_buy(user, draw, customer_info, msg="ไม่พบเรตของผู้ซื้อรายนี้")
+    blocked = common.get_blocked_map(c, lotto_name, draw_clean)
+    return dict(rates=rates, blocked=blocked, camp=camp, c_id=int(c_id), c_type=c_type), None
+
+
+def _draft_save(c, ctx, user, draw, customer_info, entries, errors=()):
+    rows, rejected, invalid = common.make_draft_rows(ctx["rates"], ctx["blocked"], entries, user, ctx["c_type"], ctx["c_id"], ctx["camp"], 1_000_000)
+    if rows:
+        c.executemany(
+            "INSERT INTO TempDraft (username, customer_id, customer_type, num, amt_teng, type, payout_rate, "
+            "discount, net, status, lotto_name, draw_date) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+    warn = list(errors)
+    if rejected:
+        warn.append("เลขปิดรับ ไม่ได้บันทึก: " + ", ".join(dict.fromkeys(rejected))[:200])
+    if invalid:
+        warn.append("ข้อมูลไม่ถูกต้อง: " + ", ".join(dict.fromkeys(invalid))[:200])
+    return back_to_buy(user, draw, customer_info, msg=" | ".join(warn) or (f"เพิ่ม {len(rows)} รายการ" if rows else "ไม่มีรายการที่บันทึกได้"))
+
 
 @app.post("/add-draft")
 def add_draft(user: str = Form(...), draw: str = Form(...), customer_info: str = Form(...),
               col_num: str = Form(None), col_teng: float = Form(0), col_tod: float = Form(0),
               raw_input: str = Form(None)):
-    sel = parse_selected(customer_info)
-    if not sel:
-        return back_to_buy(user, draw, "", msg="ไม่ได้เลือกลูกค้า / สายงาน")
-    c_id, _name, c_type = sel
-    lotto_name, draw_clean = split_draw(draw)
-    key = common.target_key(c_type, int(c_id))
-    rows, rejected, invalid = [], [], []
     conn = connect_db()
     try:
         c = conn.cursor()
-        role = (common.get_user(c, user) or {}).get("role", "Member")
-        if not can_use_target(c, user, role, c_id, c_type):
-            return back_to_buy(user, draw, customer_info, msg="คุณไม่มีสิทธิ์บันทึกโพยให้ผู้ซื้อรายนี้")
-        if not lotto_name:
-            c.execute("SELECT lotto_name FROM LotteryCampaigns WHERE draw_date=%s OR draw_date ILIKE %s ORDER BY id DESC LIMIT 1",
-                      (draw_clean, f"%{common.like_escape(draw_clean)}%"))
-            r = c.fetchone()
-            lotto_name = r[0] if r else ""
-        # เช็คสถานะงวด/เวลาปิดรับ ฝั่งเซิร์ฟเวอร์
-        c.execute("SELECT status, close_time, open_time FROM LotteryCampaigns WHERE lotto_name=%s AND (draw_date=%s OR draw_date ILIKE %s) "
-                  "ORDER BY id DESC LIMIT 1", (lotto_name, draw_clean, f"%{common.like_escape(draw_clean)}%"))
-        camp = c.fetchone()
-        if camp:
-            ok, reason = common.campaign_open({"status": camp[0], "close_time": camp[1], "open_time": camp[2]})
-            if not ok:
-                return back_to_buy(user, draw, customer_info, msg=reason)
-        rates, _src = common.get_rates(c, key, lotto_name)
-        if not rates:
-            return back_to_buy(user, draw, customer_info, msg="ไม่พบเรตของผู้ซื้อรายนี้")
-        blocked = common.get_blocked_map(c, lotto_name, draw_clean)
-
-        def process_number(n, top, bot):
-            if not re.fullmatch(r"[0-9]{1,3}", n) or not (0 <= top <= 1_000_000 and 0 <= bot <= 1_000_000):
-                invalid.append(n)
-                return
-            st = blocked.get(n, "ปกติ")
-            if st == "ปิดรับ":
-                rejected.append(n)
-                return
-            for amt, (ptype, pay_key, kind) in zip((top, bot), common.PLAYS[len(n)]):
-                if amt <= 0:
-                    continue
-                d = round(amt * common.disc_pct(rates, kind) / 100.0, 2)      # ส่วนลดเก็บเป็น "บาท"
-                rows.append((user, str(c_id), c_type, n, amt, ptype, rates[pay_key], d, round(amt - d, 2),
-                             st, lotto_name, draw_clean))
-
+        ctx, bad = _draft_prepare(c, user, draw, customer_info)
+        if bad:
+            return bad
+        entries, errors = [], []
         if col_num and col_num.strip():
-            process_number(col_num.strip(), col_teng, col_tod)
+            if col_teng <= 0 and col_tod <= 0:
+                errors.append("กรุณาระบุจำนวนเงินอย่างน้อย 1 ช่อง")
+            else:       # เลขหลายตัว (จากปุ่ม 6กลับ/รูด) ใช้ยอดเดียวกัน
+                for n in dict.fromkeys(x for x in re.split(r"[,\s]+", col_num.strip()) if x):
+                    entries.append((n, col_teng, col_tod))
         if raw_input and raw_input.strip():
             clean_raw = raw_input.strip().upper().replace(' ', '').replace('X', '*').replace('+', '*').replace('/', '*')
             hold = []
@@ -1636,41 +1724,70 @@ def add_draft(user: str = Form(...), draw: str = Form(...), customer_info: str =
                     continue
                 if '=' in block:
                     num_str, amt_str = block.split('=', 1)
-                    num_str = num_str.strip()
-                    if num_str:
-                        hold.append(num_str)
+                    if num_str.strip():
+                        hold.append(num_str.strip())
                     try:
                         if '*' in amt_str:
-                            a, b = amt_str.split('*', 1)
-                            top, bot = float(a or 0), float(b or 0)
+                            a_, b_ = amt_str.split('*', 1)
+                            top, bot = float(a_ or 0), float(b_ or 0)
                         else:
                             top, bot = float(amt_str or 0), 0.0
                     except ValueError:
-                        invalid.append(block)
+                        errors.append("ข้อมูลไม่ถูกต้อง: " + block)
                         hold = []
                         continue
-                    for n in hold:
-                        process_number(n, top, bot)
+                    entries += [(n, top, bot) for n in hold]
                     hold = []
                 else:
                     hold.append(block.strip())
-        if rows:
-            c.executemany(
-                "INSERT INTO TempDraft (username, customer_id, customer_type, num, amt_teng, type, payout_rate, "
-                "discount, net, status, lotto_name, draw_date) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+        if len(entries) > MAX_ENTRIES:
+            return back_to_buy(user, draw, customer_info, msg=f"เพิ่มได้ครั้งละไม่เกิน {MAX_ENTRIES} รายการ")
+        res = _draft_save(c, ctx, user, draw, customer_info, entries, errors[:5])
         conn.commit()
+        return res
     except Exception as e:
         conn.rollback()
         print("add_draft error:", e)
         return back_to_buy(user, draw, customer_info, msg="บันทึกไม่สำเร็จ กรุณาลองใหม่")
     finally:
         conn.close()
-    warn = []
-    if rejected:
-        warn.append("เลขปิดรับ ไม่ได้บันทึก: " + ", ".join(rejected[:30]))
-    if invalid:
-        warn.append("ข้อมูลไม่ถูกต้อง: " + ", ".join(invalid[:30]))
-    return back_to_buy(user, draw, customer_info, msg=" | ".join(warn) or (f"เพิ่ม {len(rows)} รายการ" if rows else "ไม่มีรายการที่บันทึกได้"))
+
+
+@app.post("/quick-add")
+def quick_add(user: str = Form(...), draw: str = Form(...), customer_info: str = Form(...), quick_text: str = Form("")):
+    conn = connect_db()
+    try:
+        c = conn.cursor()
+        ctx, bad = _draft_prepare(c, user, draw, customer_info)
+        if bad:
+            return bad
+        entries, errors = common.parse_quick(quick_text[:200000])
+        if len(entries) > MAX_ENTRIES:
+            return back_to_buy(user, draw, customer_info, msg=f"คีย์ด่วนได้ครั้งละไม่เกิน {MAX_ENTRIES} รายการ")
+        if not entries:
+            return back_to_buy(user, draw, customer_info, msg=" | ".join(errors[:5]) or "ไม่พบรายการที่อ่านได้ (รูปแบบ: เลข=บน*ล่าง)")
+        res = _draft_save(c, ctx, user, draw, customer_info, entries, errors[:5])
+        conn.commit()
+        return res
+    except Exception as e:
+        conn.rollback()
+        print("quick_add error:", e)
+        return back_to_buy(user, draw, customer_info, msg="บันทึกไม่สำเร็จ กรุณาลองใหม่")
+    finally:
+        conn.close()
+
+
+@app.post("/delete-draft-group")
+def delete_draft_group(user: str = Form(...), draw: str = Form(...), customer_info: str = Form(""), item_ids: str = Form("")):
+    ids = [int(x) for x in item_ids.split(",") if x.strip().isdigit()]
+    try:
+        conn = connect_db(); c = conn.cursor()
+        if ids:
+            c.execute("DELETE FROM TempDraft WHERE id = ANY(%s) AND username = %s", (ids, user))
+        conn.commit(); conn.close()
+    except Exception as e:
+        return route_error(e)
+    return back_to_buy(user, draw, customer_info)
 
 @app.get("/delete-draft-item")
 def delete_draft_item(id: int, user: str, draw: str, selected: str):
@@ -1748,7 +1865,7 @@ def clear_draft(user: str, draw: str, selected: str):
     return back_to_buy(user, draw, selected)
 
 @app.post("/confirm-bill", response_class=HTMLResponse)
-def confirm_bill(user: str = Form(...), draw: str = Form(...), customer_info: str = Form(...), lotto_name: str = Form(...)):
+def confirm_bill(request: Request, user: str = Form(...), draw: str = Form(...), customer_info: str = Form(...), lotto_name: str = Form(...)):
     sel = parse_selected(customer_info)
     if not sel:
         return back_to_buy(user, draw, "", msg="ไม่ได้เลือกลูกค้า / สายงาน")
@@ -1812,8 +1929,19 @@ def confirm_bill(user: str = Form(...), draw: str = Form(...), customer_info: st
         return route_error(e)
     finally:
         conn.close()
+    chat_note = ""
+    try:                                   # ส่งบิลใบแรกเป็นรูปให้ลูกค้าทางแชท (หลังบันทึกสำเร็จ; ส่งไม่ได้ไม่กระทบบิล)
+        with common.db() as conn2:
+            c2 = conn2.cursor()
+            sent, errs = common.send_bill_to_customer(c2, user, common.bill_dict(c2, bill_no), base_url=common.public_base(request.base_url))
+        if sent:
+            chat_note = f"ส่งบิลเป็นรูปให้ลูกค้าทางแชทแล้ว ({sent} ช่องทาง)"
+        if errs:
+            chat_note += (" · " if chat_note else "") + "ส่งแชทไม่สำเร็จ: " + "; ".join(errs)[:150]
+    except Exception as e:
+        print("send bill error:", e)
     content = Template(BILL_PRINT_TEMPLATE).render(
-        lotto_title=lotto_name, draw_date=draw_clean, draw_date_raw=draw, bill_no=bill_no, timestamp=ts,
+        chat_note=chat_note, lotto_title=lotto_name, draw_date=draw_clean, draw_date_raw=draw, bill_no=bill_no, timestamp=ts,
         customer_name=c_name, username=user, bill_items=bill_items, total_amt=total_amt,
         total_disc=total_disc, total_net=total_net, selected_target_raw=customer_info)
     return HTMLResponse(content)
@@ -2446,6 +2574,66 @@ def credit_action(user: str = Form(...), draw: str = Form("ระบบเคร
             ok, text = common.credit_adjust(c, me, target, op, amount, note)
         return RedirectResponse(url="/credits?" + urlencode({"user": user, "draw": draw, ("msg" if ok else "error"): text}), status_code=303)
     except Exception as e: return route_error(e)
+
+
+@app.get("/integrations", response_class=HTMLResponse)
+def integrations_page(request: Request, user: str, draw: str = "เชื่อมต่อแชท", msg: str = None, error: str = None):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            if me["role"] not in common.MANAGER_ROLES:
+                return RedirectResponse(url="/campaigns?" + urlencode({"user": user, "error": "เมนูนี้สำหรับผู้จัดการขึ้นไป"}), status_code=303)
+            inner = common.render_integrations(c, me, common.public_base(request.base_url), "/integrations/save", {"user": user, "draw": draw})
+        return Template(LAYOUT).render(username=user, role=me["role"], draw_date=draw, content=inner, msg=msg, error=error, current_close_time=None)
+    except Exception as e: return route_error(e)
+
+
+@app.post("/integrations/save")
+async def integrations_save_route(request: Request):
+    form = await request.form()
+    user, draw = str(form.get("user", "")), str(form.get("draw", "เชื่อมต่อแชท"))
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me or me["role"] not in common.MANAGER_ROLES:
+                return RedirectResponse(url="/login", status_code=303)
+            ok, note = common.integrations_save(c, me, common.public_base(request.base_url), str(form.get("channel", "")), form)
+        return RedirectResponse(url="/integrations?" + urlencode({"user": user, "draw": draw, ("msg" if ok else "error"): note}), status_code=303)
+    except Exception as e: return route_error(e)
+
+
+def _hdrs(request):
+    return {k.lower(): v for k, v in request.headers.items()}
+
+
+@app.post("/webhook/{channel}/{key}")
+async def webhook_in(channel: str, key: str, request: Request):
+    body = await request.body()
+    st = await run_in_threadpool(common.process_webhook, channel, key, body, _hdrs(request))
+    return JSONResponse({"ok": st == 200}, status_code=st)
+
+
+@app.get("/webhook/messenger/{key}")
+def webhook_messenger_verify(key: str, request: Request):
+    q = request.query_params
+    with common.db() as conn:
+        ch = common.chan_by_key(conn.cursor(), "messenger", key)
+    vt = (ch or {}).get("cfg", {}).get("verify_token")
+    if ch and vt and q.get("hub.mode") == "subscribe" and q.get("hub.verify_token") == vt:
+        return PlainTextResponse(q.get("hub.challenge", ""))
+    return PlainTextResponse("forbidden", status_code=403)
+
+
+@app.get("/bill-img/{bill_no}/{token}.png")
+def bill_image(bill_no: str, token: str, d: int = 0):
+    png = common.bill_image_response_data(bill_no, token, bool(d))
+    if not png:
+        return PlainTextResponse("not found", status_code=404)
+    return Response(png, media_type="image/png", headers={"Cache-Control": "private, max-age=300"})
 
 
 @app.get("/logout")

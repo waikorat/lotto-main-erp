@@ -725,7 +725,7 @@ def generate_bill_no(c, lotto_name, draw_date, t_type, t_id):
 
 # ============================================================ ยอดขายเรียลไทม์ (แอดมิน) + เจาะลึกตามสายงาน
 
-BUILD = "2026-11-24.1"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
+BUILD = "2026-11-25.1"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
 
 _SALES_COLS = "COALESCE(SUM(amount),0), COALESCE(SUM(discount),0), COALESCE(SUM(net),0), COUNT(DISTINCT bill_no), COUNT(*)"
 
@@ -1668,10 +1668,24 @@ def credit_refund(c, bill_no, by):
             _ledger(c, kind, tid, -float(net), "refund", bill_no, "ยกเลิกบิล", by)
 
 
+def _in_my_line(c, me, kind, tid):
+    """บัญชีนี้อยู่ใต้สายงานของ me (ทุกชั้น, ไม่รวมตัวเอง) หรือไม่  ผู้ใช้=อยู่ใน subtree  ลูกค้า=เจ้าของอยู่ใน subtree"""
+    names = {n.lower() for n in get_subtree(c, me["username"])}
+    if kind == "User":
+        c.execute("SELECT username FROM Users WHERE id=%s", (tid,))
+        r = c.fetchone()
+        return bool(r) and r[0].lower() in names and tid != me["id"]
+    c.execute("SELECT owner_username FROM Customers WHERE id=%s", (tid,))
+    r = c.fetchone()
+    return bool(r) and (r[0] or "").lower() in names
+
+
 def credit_adjust(c, me, target, op, amount=0.0, note=""):
-    """แอดมินจัดสรร/หัก/เคลียร์ยอด/เปิด-ปิดระบบเครดิต  target='User:5' | 'Customer:3'  คืน (ok, ข้อความ)"""
-    if me["role"] != "Admin":
-        return False, "เฉพาะแอดมินเท่านั้นที่จัดการเครดิตได้"
+    """จัดการเครดิต  target='User:5' | 'Customer:3'  คืน (ok, ข้อความ)
+    แอดมิน: allocate(สร้างเครดิตใหม่)/deduct/clear/enable/disable ได้กับทุกบัญชี
+    ผู้ใช้ทุกระดับ: transfer (แบ่งเครดิตของตัวเองให้ผู้ใช้/ลูกค้าใต้สายงานทุกชั้น ไม่เกินยอดคงเหลือของตัวเอง)
+                  reclaim  (ดึงคืนจากใต้สายงาน ไม่เกินยอดคงเหลือของผู้ถูกดึง)"""
+    is_admin = me["role"] == "Admin"
     try:
         kind, tid = target.split(":", 1)
         tid = int(tid)
@@ -1681,6 +1695,32 @@ def credit_adjust(c, me, target, op, amount=0.0, note=""):
     name = get_target_name(c, kind, tid)
     if name is None:
         return False, "ไม่พบบัญชีนี้"
+    if op in ("transfer", "reclaim"):
+        if kind == "User" and tid == me["id"]:
+            return False, "ไม่สามารถโอนให้ตัวเองได้"
+        if not _in_my_line(c, me, kind, tid):
+            return False, "โอน/ดึงเครดิตได้เฉพาะบัญชีที่อยู่ใต้สายงานของคุณเท่านั้น"
+        amount = round(float(amount or 0), 2)
+        if amount <= 0 or amount > 1e9:
+            return False, "จำนวนเงินต้องมากกว่า 0"
+        # ล็อกสองบัญชีตามลำดับคงที่ กันโอนสวนกันแล้วค้าง/ยอดเพี้ยน
+        for k, i in sorted([("User", me["id"]), (kind, tid)]):
+            c.execute(f"SELECT 1 FROM {_acct_table(k)} WHERE id=%s FOR UPDATE", (i,))
+        my = ("User", me["id"])
+        src, dst = (my, (kind, tid)) if op == "transfer" else ((kind, tid), my)
+        have = credit_balance(c, *src)
+        if have + 1e-9 < amount:
+            who = "เครดิตคงเหลือของคุณ" if op == "transfer" else f"เครดิตคงเหลือของ {name} "
+            return False, f"{who}ไม่พอ (คงเหลือ {have:,.2f} บาท ต้องการ {amount:,.2f} บาท)"
+        out_k, in_k = ("transfer_out", "transfer_in") if op == "transfer" else ("reclaim_out", "reclaim_in")
+        who_me = me["username"]
+        _ledger(c, src[0], src[1], -amount, out_k, None, note or (f"โอนให้ {name}" if op == "transfer" else f"{who_me} ดึงคืน"), who_me)
+        _ledger(c, dst[0], dst[1], amount, in_k, None, note or (f"รับจาก {who_me}" if op == "transfer" else f"ดึงคืนจาก {name}"), who_me)
+        c.execute(f"UPDATE {_acct_table(dst[0])} SET credit_enabled=TRUE WHERE id=%s", (dst[1],))
+        return True, (f"โอนเครดิต {amount:,.2f} ให้ {name} แล้ว (คงเหลือของคุณ {credit_balance(c, *my):,.2f})" if op == "transfer"
+                      else f"ดึงเครดิตคืน {amount:,.2f} จาก {name} แล้ว (คงเหลือของคุณ {credit_balance(c, *my):,.2f})")
+    if not is_admin:
+        return False, "คำสั่งนี้สำหรับแอดมินเท่านั้น (ผู้ใช้ทั่วไปแบ่งเครดิตให้สายงานตัวเองได้)"
     if op in ("enable", "disable"):
         c.execute(f"UPDATE {_acct_table(kind)} SET credit_enabled=%s WHERE id=%s", (op == "enable", tid))
         return True, f"{'เปิด' if op == 'enable' else 'ปิด'}ระบบเครดิตของ {name} แล้ว"
@@ -1707,11 +1747,12 @@ def credit_adjust(c, me, target, op, amount=0.0, note=""):
 _CREDIT_HTML = """
 <div class="card shadow p-3">
   <h3 class="fw-bold text-primary mb-1">💳 ระบบเครดิต</h3>
-  <div class="text-muted small mb-3">{% if is_admin %}แอดมินจัดสรรเครดิตให้ผู้ใช้/ตัวแทน/ลูกค้า — เมื่อออกบิลระบบจะตัดเครดิตของผู้ซื้อ (ถ้าผู้ซื้อไม่ได้เปิดเครดิต จะตัดจากเครดิตของผู้บันทึกที่เปิดเครดิตไว้) ถ้าไม่พอจะออกบิลไม่ได้ · ยกเลิกบิลจะคืนเครดิตให้อัตโนมัติ{% else %}แสดงเครดิตของคุณและลูกค้าของคุณ (แอดมินเป็นผู้จัดสรร){% endif %}</div>
+  <div class="text-muted small mb-3">{% if is_admin %}แอดมินจัดสรรเครดิตให้ผู้ใช้/ตัวแทน/ลูกค้า — เมื่อออกบิลระบบจะตัดเครดิตของผู้ซื้อ (ถ้าผู้ซื้อไม่ได้เปิดเครดิต จะตัดจากเครดิตของผู้บันทึกที่เปิดเครดิตไว้) ถ้าไม่พอจะออกบิลไม่ได้ · ยกเลิกบิลจะคืนเครดิตให้อัตโนมัติ{% else %}คุณแบ่งเครดิต "ของตัวเอง" ให้ผู้ใช้/ลูกค้าใต้สายงานได้ทุกชั้น ภายใต้ยอดคงเหลือของคุณเท่านั้น (เครดิตตั้งต้นมาจากแอดมิน) · ดึงคืนได้ไม่เกินยอดคงเหลือของผู้ถูกดึง{% endif %}</div>
+  {% if not is_admin %}<div class="alert alert-success d-flex justify-content-between align-items-center py-2"><span>💳 เครดิตคงเหลือของคุณ ({{ me_name }})</span><b class="fs-4">{{ "{:,.2f}".format(my_balance) }} บาท</b></div>{% endif %}
   <input type="text" id="cr-q" class="form-control form-control-sm mb-2" placeholder="🔍 ค้นหาชื่อ" style="max-width:280px">
   <div class="table-responsive">
   <table class="table table-sm table-bordered align-middle text-center" id="cr-t">
-    <thead class="table-dark"><tr><th>ชื่อ</th><th>ประเภท</th><th>ระบบเครดิต</th><th>คงเหลือ</th><th>ซื้อไปแล้ว</th>{% if is_admin %}<th style="min-width:420px">จัดการ</th>{% endif %}</tr></thead>
+    <thead class="table-dark"><tr><th>ชื่อ</th><th>ประเภท</th><th>ระบบเครดิต</th><th>คงเหลือ</th><th>ซื้อไปแล้ว</th><th style="min-width:{{ 420 if is_admin else 330 }}px">จัดการ</th></tr></thead>
     <tbody>
     {% for a in accts %}
       <tr><td class="text-start"><b>{{ a.name }}</b></td><td>{{ 'ผู้ใช้/ตัวแทน' if a.kind == 'User' else 'ลูกค้า' }}</td>
@@ -1729,8 +1770,17 @@ _CREDIT_HTML = """
           <button name="op" value="clear" class="btn btn-outline-dark btn-sm" onclick="return confirm('เคลียร์ยอดของ {{ a.name }} ให้เป็น 0 ?')">เคลียร์ยอด</button>
           {% if a.enabled %}<button name="op" value="disable" class="btn btn-outline-secondary btn-sm">ปิดเครดิต</button>
           {% else %}<button name="op" value="enable" class="btn btn-outline-primary btn-sm">เปิดเครดิต</button>{% endif %}
+        </form></td>
+      {% else %}<td>
+        <form method="POST" action="{{ action }}" class="d-flex flex-wrap gap-1 justify-content-center">
+          {% for k, v in hidden.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+          <input type="hidden" name="target" value="{{ a.kind }}:{{ a.id }}">
+          <input type="number" name="amount" step="0.01" min="0.01" class="form-control form-control-sm" placeholder="จำนวนเงิน" style="width:110px" required>
+          <input type="text" name="note" class="form-control form-control-sm" placeholder="หมายเหตุ" style="width:110px" maxlength="200">
+          <button name="op" value="transfer" class="btn btn-success btn-sm">➡️ โอนให้</button>
+          <button name="op" value="reclaim" class="btn btn-outline-warning btn-sm" onclick="return confirm('ดึงเครดิตคืนจาก {{ a.name }} ?')">⬅️ ดึงคืน</button>
         </form></td>{% endif %}</tr>
-    {% else %}<tr><td colspan="6" class="text-muted py-3">ไม่มีบัญชี</td></tr>{% endfor %}
+    {% else %}<tr><td colspan="6" class="text-muted py-3">{{ 'ไม่มีบัญชี' if is_admin else 'ยังไม่มีผู้ใช้/ลูกค้าใต้สายงานของคุณ' }}</td></tr>{% endfor %}
     </tbody>
   </table></div>
   <h6 class="fw-bold mt-3">🧾 รายการล่าสุด</h6>
@@ -1742,7 +1792,7 @@ _CREDIT_HTML = """
 <script>document.getElementById('cr-q').oninput=function(){var q=this.value.toLowerCase();document.querySelectorAll('#cr-t tbody tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)<0?'none':'';});};</script>
 """
 
-_KIND_TH = {"allocate": "จัดสรร", "adjust": "หัก/ปรับ", "settle": "เคลียร์ยอด", "purchase": "ซื้อโพย", "refund": "คืนเครดิต"}
+_KIND_TH = {"transfer_out": "โอนออก", "transfer_in": "รับโอน", "reclaim_out": "ถูกดึงคืน", "reclaim_in": "ดึงคืนเข้า", "allocate": "จัดสรร", "adjust": "หัก/ปรับ", "settle": "เคลียร์ยอด", "purchase": "ซื้อโพย", "refund": "คืนเครดิต"}
 
 
 def render_credits(c, me, action, hidden):
@@ -1753,9 +1803,11 @@ def render_credits(c, me, action, hidden):
         c.execute("SELECT 'Customer', id, name, COALESCE(credit_enabled,FALSE) FROM Customers ORDER BY name LIMIT 2000")
         accts += c.fetchall()
     else:
-        c.execute("SELECT 'User', id, username, COALESCE(credit_enabled,FALSE) FROM Users WHERE id=%s", (me["id"],))
+        subs = get_subtree(c, me["username"])
+        low = [n.lower() for n in subs]
+        c.execute("SELECT 'User', id, username, COALESCE(credit_enabled,FALSE) FROM Users WHERE LOWER(username) = ANY(%s) AND id<>%s ORDER BY username LIMIT 1000", (low, me["id"]))
         accts = c.fetchall()
-        c.execute("SELECT 'Customer', id, name, COALESCE(credit_enabled,FALSE) FROM Customers WHERE LOWER(owner_username)=LOWER(%s) ORDER BY name", (me["username"],))
+        c.execute("SELECT 'Customer', id, name, COALESCE(credit_enabled,FALSE) FROM Customers WHERE LOWER(owner_username) = ANY(%s) ORDER BY name LIMIT 2000", (low,))
         accts += c.fetchall()
     c.execute("SELECT target_type, target_id, COALESCE(SUM(delta),0), COALESCE(SUM(CASE WHEN kind IN ('purchase') THEN -delta END),0) "
               "FROM CreditLedger GROUP BY target_type, target_id")
@@ -1764,18 +1816,23 @@ def render_credits(c, me, action, hidden):
             for k, i, n, e in accts]
     rows.sort(key=lambda r: (not r["enabled"], r["name"].lower()))
     names = {(r["kind"], r["id"]): r["name"] for r in rows}
+    my_balance = 0.0
+    if not is_admin:
+        my_balance = credit_balance(c, "User", me["id"])
+        names[("User", me["id"])] = me["username"] + " (คุณ)"
     if is_admin:
         c.execute("SELECT created_at, target_type, target_id, kind, delta, bill_no, note, by_user FROM CreditLedger ORDER BY id DESC LIMIT 60")
     else:
         keys = list(names)
-        c.execute("SELECT created_at, target_type, target_id, kind, delta, bill_no, note, by_user FROM CreditLedger ORDER BY id DESC LIMIT 400")
+        c.execute("SELECT created_at, target_type, target_id, kind, delta, bill_no, note, by_user FROM CreditLedger ORDER BY id DESC LIMIT 1500")
     ledger = []
     for r in c.fetchall():
         nm = names.get((r[1], r[2]))
         if nm is None and not is_admin:
             continue
         ledger.append((r[0], nm or f"{r[1]}#{r[2]}", _KIND_TH.get(r[3], r[3]), float(r[4]), r[5], r[6], r[7]))
-    return _Jinja(_CREDIT_HTML, autoescape=True).render(accts=rows, ledger=ledger[:60], action=action, hidden=hidden, is_admin=is_admin)
+    return _Jinja(_CREDIT_HTML, autoescape=True).render(accts=rows, ledger=ledger[:60], action=action, hidden=hidden, is_admin=is_admin,
+                                                    my_balance=my_balance, me_name=me["username"])
 
 
 # ============================================================ เชื่อมต่อ LINE / Facebook Messenger
@@ -1788,6 +1845,8 @@ CHANNELS = {
         ("access_token", "Page access token", True),
         ("app_secret", "App secret", True),
         ("verify_token", "Verify token (ตั้งเองอะไรก็ได้ แล้วใช้ค่าเดียวกันในหน้า Webhook ของ Meta)", False)]},
+    "telegram": {"title": "Telegram Bot", "fields": [
+        ("bot_token", "Bot token (ได้จาก @BotFather เช่น 123456:ABC...)", True)]},
 }
 
 
@@ -1877,10 +1936,177 @@ def messenger_send(cfg, psid, text):
     return (st == 200), ("" if st == 200 else f"Messenger {st}: {body[:120]}")
 
 
+def _multipart(fields, files):
+    """สร้างข้อมูล multipart/form-data (ไม่พึ่งไลบรารีเพิ่ม)  files = {ชื่อฟิลด์: (ชื่อไฟล์, bytes, mime)}"""
+    bd = "----lotto" + secrets.token_hex(12)
+    out = []
+    for k, v in fields.items():
+        out.append(f'--{bd}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode("utf-8"))
+    for k, (fn, data, mime) in files.items():
+        out.append(f'--{bd}\r\nContent-Disposition: form-data; name="{k}"; filename="{fn}"\r\nContent-Type: {mime}\r\n\r\n'.encode("utf-8"))
+        out.append(data)
+        out.append(b"\r\n")
+    out.append(f"--{bd}--\r\n".encode())
+    return b"".join(out), f"multipart/form-data; boundary={bd}"
+
+
+def _post_multipart(url, fields, files):
+    body, ctype = _multipart(fields, files)
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": ctype}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, r.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "ignore")[:300]
+    except Exception as e:
+        return 0, str(e)[:200]
+
+
+def telegram_api(cfg, method, payload=None, files=None, fields=None):
+    tok = cfg.get("bot_token")
+    if not tok:
+        return False, "ยังไม่ได้ตั้งค่า Bot token"
+    url = f"https://api.telegram.org/bot{tok}/{method}"
+    if files:
+        st, body = _post_multipart(url, fields or {}, files)
+    else:
+        st, body = _post_json(url, payload or {}, {})
+    return (st == 200), ("" if st == 200 else f"Telegram {st}: {body[:120]}")
+
+
+def telegram_send(cfg, chat_id, text):
+    return telegram_api(cfg, "sendMessage", {"chat_id": chat_id, "text": text[:4000]})
+
+
+def telegram_set_webhook(cfg, url, secret):
+    return telegram_api(cfg, "setWebhook", {"url": url, "secret_token": secret, "allowed_updates": ["message"]})
+
+
 def send_text(channel, cfg, ext_id, text, reply_token=None):
     if channel == "line":
         return line_send(cfg, to=ext_id, messages=[{"type": "text", "text": text[:4900]}], reply_token=reply_token)
+    if channel == "telegram":
+        return telegram_send(cfg, ext_id, text)
     return messenger_send(cfg, ext_id, text)
+
+
+def messenger_send_image(cfg, psid, png, name="bill.png"):
+    tok = cfg.get("access_token")
+    if not tok:
+        return False, "ยังไม่ได้ตั้งค่า Page access token"
+    st, body = _post_multipart("https://graph.facebook.com/v19.0/me/messages?access_token=" + quote(tok),
+                               {"recipient": json.dumps({"id": psid}), "messaging_type": "RESPONSE",
+                                "message": json.dumps({"attachment": {"type": "image", "payload": {"is_reusable": False}}})},
+                               {"filedata": (name, png, "image/png")})
+    return (st == 200), ("" if st == 200 else f"Messenger {st}: {body[:120]}")
+
+
+def telegram_send_image(cfg, chat_id, png, caption="", name="bill.png"):
+    return telegram_api(cfg, "sendPhoto", files={"photo": (name, png, "image/png")},
+                        fields={"chat_id": str(chat_id), "caption": caption[:1000]})
+
+
+# ------------------------------------------------------------ บิลเป็นรูปภาพ (PNG)
+
+_FONT_DIRS = [os.environ.get("BILL_FONT_DIR", ""), os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts"),
+              "/usr/share/fonts/opentype/tlwg", "/usr/share/fonts/truetype/tlwg"]
+
+
+def _find_font(bold):
+    for d in _FONT_DIRS:
+        for nm in (("Loma-Bold.otf", "Garuda-Bold.ttf", "THSarabunNew Bold.ttf") if bold else ("Loma.otf", "Garuda.ttf", "THSarabunNew.ttf")):
+            if d and os.path.exists(os.path.join(d, nm)):
+                return os.path.join(d, nm)
+    return None
+
+
+def bill_image_png(b, with_disc=False):
+    """วาดบิลเป็นไฟล์ PNG (ภาษาไทย)  with_disc=True คือบิลใบที่ 2 (มีส่วนลดและยอดสุทธิ)  ต้องมี Pillow + ฟอนต์ใน ./fonts"""
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+    fr, fb = _find_font(False), _find_font(True)
+    if not fr:
+        raise RuntimeError("ไม่พบฟอนต์ไทยสำหรับวาดบิล (วางไฟล์ Loma.otf / Loma-Bold.otf ในโฟลเดอร์ fonts)")
+
+    def F(sz, bold=False):
+        return ImageFont.truetype((fb if bold and fb else fr), sz)
+
+    W, M = 760, 28
+    rows = b["rows"]
+    LIM = 150
+    shown = rows[:LIM]
+    RH, HEAD = 36, 196
+    H = HEAD + 44 + RH * len(shown) + (30 if len(rows) > LIM else 0) + (110 if with_disc else 70) + 40
+    im = Image.new("RGB", (W, H), "#ffffff")
+    d = ImageDraw.Draw(im)
+    d.rectangle([0, 0, W, 96], fill="#111111")
+    d.text((W // 2, 34), str(b["lotto"]), font=F(34, True), fill="#f3e5ab", anchor="mm")
+    d.text((W // 2, 72), f"งวดวันที่ {b['draw']}" + ("   (ใบที่ 2 – มีส่วนลด)" if with_disc else ""), font=F(22), fill="#ffffff", anchor="mm")
+    y = 112
+    d.text((M, y), f"เลขที่บิล {b['bill_no']}", font=F(22, True), fill="#111111")
+    d.text((W - M, y), str(b["ts"]), font=F(20), fill="#555555", anchor="ra")
+    y += 30
+    d.text((M, y), f"ลูกค้า: {b['customer']}", font=F(22), fill="#111111")
+    d.text((W - M, y), f"ผู้ขาย: {b['seller']}", font=F(22), fill="#111111", anchor="ra")
+    y = HEAD
+    if with_disc:
+        cols = [("เลข", 0.07, "l"), ("บน/3ตรง", 0.22, "r"), ("ล่าง/โต๊ด", 0.22, "r"), ("รวม", 0.17, "r"), ("ส่วนลด", 0.16, "r"), ("สุทธิ", 0.16, "r")]
+    else:
+        cols = [("เลข", 0.10, "l"), ("บน/3ตรง", 0.30, "r"), ("ล่าง/โต๊ด", 0.30, "r"), ("รวม", 0.30, "r")]
+    inner = W - 2 * M
+    xs, x = [], M
+    for _n_, wf, al in cols:
+        xs.append((x, x + int(inner * wf), al))
+        x += int(inner * wf)
+    d.rectangle([M, y - 4, W - M, y + 36], fill="#222222")
+    for (x0, x1, al), (nm, _w, _a) in zip(xs, cols):
+        d.text((x0 + 8 if al == "l" else x1 - 8, y + 16), nm, font=F(20, True), fill="#ffffff", anchor="lm" if al == "l" else "rm")
+    y += 40
+
+    def cell(v, rate):
+        t = _n(v)
+        return t + (f" ({rate:g})" if v and rate else "")
+    for i, r in enumerate(shown):
+        if i % 2:
+            d.rectangle([M, y, W - M, y + RH], fill="#f4f4f4")
+        vals = [str(r["num"]), cell(r["top"], r["top_rate"]), cell(r["bot"], r["bot_rate"]), _n(r["total"])]
+        if with_disc:
+            vals += [_n(r["disc"]), _n(r["net"])]
+        for (x0, x1, al), v in zip(xs, vals):
+            d.text((x0 + 8 if al == "l" else x1 - 8, y + RH // 2), v, font=F(20, al == "l"), fill="#111111", anchor="lm" if al == "l" else "rm")
+        y += RH
+    if len(rows) > LIM:
+        d.text((M, y + 4), f"... และอีก {len(rows) - LIM} รายการ", font=F(20), fill="#888888")
+        y += 30
+    d.line([M, y + 6, W - M, y + 6], fill="#111111", width=2)
+    y += 20
+    d.text((M, y), "ยอดรวม", font=F(26, True), fill="#198754")
+    d.text((W - M, y), f"{b['total']:,.2f} บาท", font=F(26, True), fill="#198754", anchor="ra")
+    if with_disc:
+        y += 38
+        d.text((M, y), f"ส่วนลด {b['disc']:,.2f}", font=F(22), fill="#c0392b")
+        d.text((W - M, y), f"สุทธิ {b['net']:,.2f} บาท", font=F(26, True), fill="#111111", anchor="ra")
+    buf = io.BytesIO()
+    im.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+def bill_image_token(bill_no, with_disc=False):
+    return _sign(f"billimg|{bill_no}|{1 if with_disc else 0}")[:32]
+
+
+def bill_image_url(base, bill_no, with_disc=False):
+    """URL สาธารณะของรูปบิล (เซ็นด้วย SECRET_KEY ใช้ให้ LINE ดึงรูป)"""
+    return f"{base.rstrip('/')}/bill-img/{quote(bill_no, safe='')}/{bill_image_token(bill_no, with_disc)}.png" + ("?d=1" if with_disc else "")
+
+
+def bill_image_response_data(bill_no, token, with_disc):
+    """ตรวจโทเค็นแล้วคืน bytes ของ PNG (หรือ None)"""
+    if not hmac.compare_digest(token or "", bill_image_token(bill_no, with_disc)):
+        return None
+    with db() as conn:
+        b = bill_dict(conn.cursor(), bill_no)
+    return bill_image_png(b, with_disc) if b else None
 
 
 def _n(v):
@@ -1953,21 +2179,42 @@ def bill_dict(c, bill_no):
             "customer_id": rs[0][13], "customer_type": rs[0][14]}
 
 
-def send_bill_to_customer(c, owner, bill):
-    """ส่งบิลใบแรก (ไม่มีส่วนลด) ให้ลูกค้าทุกช่องทางที่ผูกไว้  คืน (จำนวนที่ส่งสำเร็จ, [ข้อผิดพลาด])"""
+def send_bill_to_customer(c, owner, bill, base_url=""):
+    """ส่งบิลใบแรก (ไม่มีส่วนลด) เป็น "รูปภาพ" ให้ลูกค้าทุกช่องทางที่ผูกไว้ ถ้าวาดรูป/ส่งรูปไม่ได้จะสำรองเป็นข้อความ
+    คืน (จำนวนที่ส่งสำเร็จ, [ข้อผิดพลาด])"""
     if not bill or bill.get("customer_type") != "Customer":
         return 0, []
     c.execute("SELECT channel, external_id FROM ChannelLinks WHERE owner_username=%s AND customer_id=%s", (owner, bill["customer_id"]))
     links = c.fetchall()
     sent, errs = 0, []
+    png = None
+    if links:
+        try:
+            png = bill_image_png(bill)
+        except Exception as e:
+            errs.append("วาดรูปบิลไม่สำเร็จ ส่งเป็นข้อความแทน: " + str(e)[:80])
+    cap = f"บิล {bill['bill_no']} ยอด {bill['total']:,.2f} บาท"
     for channel, ext in links:
         ch = chan_get(c, owner, channel)
         if not ch or not ch["enabled"]:
             continue
+        ok, err = False, ""
         if channel == "line":
-            ok, err = line_send(ch["cfg"], to=ext, messages=[bill_flex(bill)])
+            if png and base_url.startswith("https://"):
+                u = bill_image_url(base_url, bill["bill_no"])
+                ok, err = line_send(ch["cfg"], to=ext, messages=[{"type": "image", "originalContentUrl": u, "previewImageUrl": u}])
+            if not ok:
+                ok, err = line_send(ch["cfg"], to=ext, messages=[bill_flex(bill)])
+        elif channel == "telegram":
+            if png:
+                ok, err = telegram_send_image(ch["cfg"], ext, png, cap)
+            if not ok:
+                ok, err = telegram_send(ch["cfg"], ext, bill_text(bill))
         else:
-            ok, err = messenger_send(ch["cfg"], ext, bill_text(bill))
+            if png:
+                ok, err = messenger_send_image(ch["cfg"], ext, png)
+            if not ok:
+                ok, err = messenger_send(ch["cfg"], ext, bill_text(bill))
         sent += 1 if ok else 0
         if not ok:
             errs.append(err)
@@ -2051,3 +2298,134 @@ def handle_chat_message(c, owner, channel, ext_id, text):
     if errors:
         msg.append("อ่านไม่ได้: " + "; ".join(errors[:3]))
     return "\n".join(msg)
+
+
+# ------------------------------------------------------------ ประมวลผล webhook (ใช้ร่วมกันทั้งสองระบบ)
+
+def process_webhook(channel, key, body: bytes, headers):
+    """คืนรหัสสถานะ HTTP  headers = dict ที่คีย์เป็นตัวพิมพ์เล็ก"""
+    replies, cfg = [], None
+    try:
+        data = json.loads(body.decode("utf-8") or "{}")
+    except ValueError:
+        return 400
+    with db() as conn:
+        c = conn.cursor()
+        ch = chan_by_key(c, channel, key)
+        if not ch:
+            return 404
+        owner, cfg = ch["owner"], ch["cfg"]
+        if channel == "line":
+            if not cfg.get("channel_secret") or not verify_line_signature(cfg["channel_secret"], body, headers.get("x-line-signature", "")):
+                return 403
+            for ev in data.get("events") or []:
+                msg = ev.get("message") or {}
+                uid = (ev.get("source") or {}).get("userId")
+                if ev.get("type") == "message" and msg.get("type") == "text" and uid:
+                    t = handle_chat_message(c, owner, "line", uid, msg.get("text", ""))
+                    if t:
+                        replies.append((uid, t, ev.get("replyToken")))
+        elif channel == "messenger":
+            if not cfg.get("app_secret") or not verify_fb_signature(cfg["app_secret"], body, headers.get("x-hub-signature-256", "")):
+                return 403
+            for entry in data.get("entry") or []:
+                for m in entry.get("messaging") or []:
+                    psid, text = (m.get("sender") or {}).get("id"), (m.get("message") or {}).get("text")
+                    if psid and text and not (m.get("message") or {}).get("is_echo"):
+                        t = handle_chat_message(c, owner, "messenger", psid, text)
+                        if t:
+                            replies.append((psid, t, None))
+        elif channel == "telegram":
+            # Telegram ส่งรหัสลับที่เราตั้งตอน setWebhook มาใน header (ใช้ webhook_key เป็นรหัส)
+            if not hmac.compare_digest(headers.get("x-telegram-bot-api-secret-token", ""), key):
+                return 403
+            msg = data.get("message") or {}
+            chat_id = (msg.get("chat") or {}).get("id")
+            text = msg.get("text")
+            if chat_id and text and not (msg.get("from") or {}).get("is_bot"):
+                text = re.sub(r"^/(start|help)(@\w+)?\s*", "", text).strip() or "help"
+                if text.lower() == "help":
+                    replies.append((str(chat_id), "ยินดีต้อนรับ \U0001F44B ผูกบัญชีก่อนโดยพิมพ์: ผูก <รหัสลูกค้า>\n\n" + HELP_TEXT, None))
+                else:
+                    t = handle_chat_message(c, owner, "telegram", str(chat_id), text)
+                    if t:
+                        replies.append((str(chat_id), t, None))
+        else:
+            return 404
+    for ext, text, token in replies:
+        ok, err = send_text(channel, cfg, ext, text, reply_token=token)
+        if not ok:
+            print(channel, "reply failed:", err)
+    return 200
+
+
+# ------------------------------------------------------------ หน้าตั้งค่าเชื่อมต่อแชท (ใช้ร่วมกันทั้งสองระบบ)
+
+_INTEG_HTML = """
+<div class="container my-3" style="max-width:900px">
+  <h3 class="fw-bold text-primary mb-1">🔗 เชื่อมต่อแชท (LINE / Messenger / Telegram)</h3>
+  <p class="text-muted small">ตั้งค่าบัญชีของคุณเองเพื่อ ① รับโพยจากลูกค้าทางแชทเข้าโพยร่าง ② ส่งบิลเป็นรูปภาพให้ลูกค้าเมื่อกด "บันทึกบิล/ส่งบิล" ลูกค้าผูกบัญชีโดยพิมพ์ <code>ผูก รหัส</code> ในแชท (รหัสดูได้ที่หน้า "จัดการลูกค้า")</p>
+  {% for ch in channels %}
+  <div class="card shadow-sm p-3 mb-3">
+    <h5 class="fw-bold">{{ ch.title }} {% if ch.saved %}<span class="badge {{ 'bg-success' if ch.enabled else 'bg-secondary' }}">{{ 'เปิดใช้งาน' if ch.enabled else 'ปิดอยู่' }}</span>{% else %}<span class="badge bg-light text-dark border">ยังไม่ตั้งค่า</span>{% endif %}</h5>
+    {% if ch.key %}
+    <div class="mb-2"><label class="form-label small fw-bold mb-0">Webhook URL (นำไปวางในหน้าตั้งค่าของ {{ {'line':'LINE Developers','messenger':'Meta for Developers','telegram':'Telegram (ระบบตั้งให้อัตโนมัติเมื่อกดบันทึก)'}[ch.id] }})</label>
+      <input class="form-control form-control-sm" readonly value="{{ ch.url }}" onclick="this.select()"></div>
+    {% else %}<div class="alert alert-light border py-1 small">บันทึกค่าด้านล่างก่อน ระบบจะสร้าง Webhook URL ให้</div>{% endif %}
+    <form method="POST" action="{{ action }}">
+      {% for k, v in hidden.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+      <input type="hidden" name="channel" value="{{ ch.id }}">
+      {% for f in ch.fields %}
+      <div class="mb-2"><label class="form-label small fw-bold mb-0">{{ f.label }}</label>
+        <input type="{{ 'password' if f.secret else 'text' }}" name="{{ f.key }}" class="form-control form-control-sm" autocomplete="off"
+          placeholder="{{ 'ตั้งค่าแล้ว — เว้นว่างเพื่อคงค่าเดิม' if f.has else '' }}" value="{{ '' if f.secret else f.value }}"></div>
+      {% endfor %}
+      <div class="form-check mb-2"><input class="form-check-input" type="checkbox" name="enabled" value="1" id="en_{{ ch.id }}" {{ 'checked' if ch.enabled or not ch.saved }}><label class="form-check-label small" for="en_{{ ch.id }}">เปิดใช้งาน</label></div>
+      <button class="btn btn-primary btn-sm fw-bold px-4">💾 บันทึก</button>
+    </form>
+    <details class="mt-2 small"><summary class="fw-bold">วิธีตั้งค่า</summary>
+      {% if ch.id == 'line' %}
+      <ol class="mb-0"><li>สร้าง Messaging API channel ที่ LINE Developers Console</li><li>คัดลอก Channel secret และออก Channel access token (long-lived) มาใส่ด้านบน</li><li>วาง Webhook URL ในแท็บ Messaging API → เปิด "Use webhook"</li><li>ลูกค้าเพิ่มเพื่อน OA แล้วพิมพ์ <code>ผูก รหัสลูกค้า</code></li></ol>
+      {% elif ch.id == 'telegram' %}
+      <ol class="mb-0"><li>เปิดแชท @BotFather ใน Telegram พิมพ์ <code>/newbot</code> ตั้งชื่อบอท แล้วคัดลอก Bot token มาใส่ด้านบน</li><li>กด "บันทึก" — ระบบจะตั้ง Webhook ให้อัตโนมัติ</li><li>ลูกค้าเปิดบอทของคุณ กด Start แล้วพิมพ์ <code>ผูก รหัสลูกค้า</code></li></ol>
+      {% else %}
+      <ol class="mb-0"><li>สร้างแอปที่ Meta for Developers เพิ่มผลิตภัณฑ์ Messenger และเชื่อมกับ Facebook Page</li><li>คัดลอก Page access token และ App secret มาใส่ด้านบน ตั้ง Verify token เอง</li><li>ที่หน้า Webhooks ใส่ Callback URL (ด้านบน) และ Verify token เดียวกัน แล้ว subscribe เหตุการณ์ <code>messages</code></li><li>ลูกค้าส่งข้อความหาเพจแล้วพิมพ์ <code>ผูก รหัสลูกค้า</code></li></ol>
+      {% endif %}
+    </details>
+  </div>
+  {% endfor %}
+</div>
+"""
+
+
+def render_integrations(c, me, base, action, hidden):
+    channels = []
+    for cid, meta in CHANNELS.items():
+        cur = chan_get(c, me["username"], cid)
+        cfg = cur["cfg"] if cur else {}
+        channels.append({"id": cid, "title": meta["title"], "saved": bool(cur), "enabled": bool(cur and cur["enabled"]),
+                         "key": cur["key"] if cur else "", "url": f"{base}/webhook/{cid}/{cur['key']}" if cur else "",
+                         "fields": [{"key": k, "label": lb, "secret": sec, "has": bool(cfg.get(k)), "value": cfg.get(k, "") if not sec else ""}
+                                    for k, lb, sec in meta["fields"]]})
+    return _Jinja(_INTEG_HTML, autoescape=True).render(channels=channels, action=action, hidden=hidden)
+
+
+def integrations_save(c, me, base, channel, form):
+    """บันทึกการเชื่อมต่อ (ใช้ร่วมกัน)  คืน (ok, ข้อความ)"""
+    if not chan_save(c, me["username"], channel, {k: str(v) for k, v in form.items()}, enabled=bool(form.get("enabled"))):
+        return False, "ช่องทางไม่ถูกต้อง"
+    note = "บันทึกการเชื่อมต่อแล้ว"
+    if channel == "telegram":
+        cur = chan_get(c, me["username"], "telegram")
+        if cur and cur["enabled"]:
+            ok, err = telegram_set_webhook(cur["cfg"], f"{base}/webhook/telegram/{cur['key']}", cur["key"])
+            note += " · ตั้ง Webhook ของ Telegram อัตโนมัติแล้ว ✅" if ok else f" · ตั้ง Webhook อัตโนมัติไม่สำเร็จ: {err}"
+    return True, note
+
+
+def public_base(base):
+    """Render อยู่หลัง proxy จึงบังคับ https ถ้าไม่ใช่ localhost"""
+    base = str(base).rstrip("/")
+    if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
+        base = "https://" + base[len("http://"):]
+    return base
