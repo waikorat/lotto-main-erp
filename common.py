@@ -725,7 +725,7 @@ def generate_bill_no(c, lotto_name, draw_date, t_type, t_id):
 
 # ============================================================ ยอดขายเรียลไทม์ (แอดมิน) + เจาะลึกตามสายงาน
 
-BUILD = "2026-11-25.1"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
+BUILD = "2026-11-28.1"      # หมายเลขรุ่นของ common.py (แสดงในหน้ายอดขายสดและ log ตอนสตาร์ต)
 
 _SALES_COLS = "COALESCE(SUM(amount),0), COALESCE(SUM(discount),0), COALESCE(SUM(net),0), COUNT(DISTINCT bill_no), COUNT(*)"
 
@@ -997,6 +997,10 @@ MIGRATIONS = [
     "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS credit_enabled BOOLEAN DEFAULT FALSE",
     "ALTER TABLE Customers ADD COLUMN IF NOT EXISTS link_code TEXT",
     "UPDATE Customers SET link_code = upper(substr(md5(random()::text || id::text), 1, 6)) WHERE link_code IS NULL OR link_code = ''",
+    "CREATE TABLE IF NOT EXISTS Payments (id SERIAL PRIMARY KEY, seller TEXT, buyer_type TEXT, buyer_id INTEGER, direction TEXT, "
+    "amount NUMERIC(14,2), scope TEXT, lotto_name TEXT, draw_date TEXT, note TEXT, credit_added NUMERIC(14,2) DEFAULT 0, "
+    "by_user TEXT, created_at TEXT, voided BOOLEAN DEFAULT FALSE)",
+    "CREATE INDEX IF NOT EXISTS idx_payments_seller ON Payments (seller)",
     "CREATE TABLE IF NOT EXISTS CreditLedger (id SERIAL PRIMARY KEY, target_type TEXT, target_id INTEGER, delta NUMERIC(14,2), "
     "kind TEXT, bill_no TEXT, note TEXT, by_user TEXT, created_at TEXT)",
     "CREATE INDEX IF NOT EXISTS ix_creditledger_target ON CreditLedger (target_type, target_id)",
@@ -1792,7 +1796,7 @@ _CREDIT_HTML = """
 <script>document.getElementById('cr-q').oninput=function(){var q=this.value.toLowerCase();document.querySelectorAll('#cr-t tbody tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)<0?'none':'';});};</script>
 """
 
-_KIND_TH = {"transfer_out": "โอนออก", "transfer_in": "รับโอน", "reclaim_out": "ถูกดึงคืน", "reclaim_in": "ดึงคืนเข้า", "allocate": "จัดสรร", "adjust": "หัก/ปรับ", "settle": "เคลียร์ยอด", "purchase": "ซื้อโพย", "refund": "คืนเครดิต"}
+_KIND_TH = {"transfer_out": "โอนออก", "transfer_in": "รับโอน", "reclaim_out": "ถูกดึงคืน", "reclaim_in": "ดึงคืนเข้า", "allocate": "จัดสรร", "adjust": "หัก/ปรับ", "settle": "เคลียร์ยอด", "purchase": "ซื้อโพย", "refund": "คืนเครดิต", "payment": "รับชำระ"}
 
 
 def render_credits(c, me, action, hidden):
@@ -2429,3 +2433,538 @@ def public_base(base):
     if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
         base = "https://" + base[len("http://"):]
     return base
+
+
+# ============================================================ บัญชี / รับชำระ (ผู้ขาย <-> ผู้ซื้อ)
+# ผู้ขาย = ผู้ใช้ที่คีย์บิล (Transactions.username)  ผู้ซื้อ = ลูกค้าของเขา หรือผู้ใช้ใต้สาย (customer_type='User')
+# ค้างชำระ = (ยอดสุทธิที่ขาย - เงินรางวัลที่ต้องจ่าย) - รับชำระ   (บวก = ผู้ซื้อค้างผู้ขาย, ลบ = ผู้ขายต้องจ่ายผู้ซื้อ)
+
+def _to_id(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_sales(c, where, args):
+    """รวมยอดจาก Transactions ตามเงื่อนไข -> list ของ dict (รวมกลุ่มตามเลข/ประเภท/สถานะ เพื่อลดจำนวนแถว)"""
+    c.execute("SELECT username, COALESCE(customer_type,'Customer'), customer_id, COALESCE(lotto_name,''), draw_date, num, type, "
+              "COALESCE(status,''), COALESCE(payout_rate,0), SUM(amount), SUM(COALESCE(discount,0)), SUM(COALESCE(net,0)), MIN(id) "
+              f"FROM Transactions WHERE {where} GROUP BY 1,2,3,4,5,6,7,8,9", args)
+    return [dict(seller=r[0], bt=r[1], bid=_to_id(r[2]), lotto=r[3], draw=r[4], num=r[5], ttype=r[6], status=r[7],
+                 rate=float(r[8]), amt=float(r[9] or 0), disc=float(r[10] or 0), net=float(r[11] or 0), mid=r[12] or 0) for r in c.fetchall()]
+
+
+def _draw_lookups(c):
+    c.execute("SELECT draw_date, prize_1, bottom_2 FROM DrawResults")
+    results = {r[0]: ((r[1] or "").strip(), (r[2] or "").strip()) for r in c.fetchall() if (r[1] or "").strip()}
+    c.execute("SELECT draw_date, raw_num, status FROM BlockedNumbers")
+    half = {}
+    for d, n, st in c.fetchall():
+        if n and st != "ปิดรับ":
+            half.setdefault(d, set()).add(str(n).strip())
+    return results, half
+
+
+def _bucket(rows, results, half):
+    """-> {(bt,bid,seller): {(lotto,draw): {...}}}"""
+    out = {}
+    for r in rows:
+        res = find_result(results, r["draw"]) if results else None
+        hs = find_result(half, r["draw"]) if half else None
+        hs = set(hs or ())
+        if r["status"] == "จ่ายครึ่ง":
+            hs.add(str(r["num"]).strip())
+        pay = row_payout(r["num"], r["ttype"], r["amt"], r["rate"], res[0], res[1], hs) if res else 0.0
+        d = out.setdefault((r["bt"], r["bid"], r["seller"]), {}).setdefault((r["lotto"], r["draw"]),
+            {"lotto": r["lotto"], "draw": r["draw"], "amount": 0.0, "disc": 0.0, "net": 0.0, "payout": 0.0, "has_result": bool(res), "mid": r["mid"]})
+        d["amount"] += r["amt"]; d["disc"] += r["disc"]; d["net"] += r["net"]; d["payout"] += pay
+        d["mid"] = min(d["mid"], r["mid"]) if d["mid"] else r["mid"]
+    return out
+
+
+def _apply_payments(draws, pays):
+    """กระจายรับชำระเข้าแต่ละงวด: ระบุงวดก่อน -> รายหวย -> ยอดรวม (เก่าไปใหม่)  คืน (draws พร้อม paid/due, ยอดที่ไม่มีงวดรองรับ)"""
+    for d in draws:
+        d["profit"] = d["net"] - d["payout"]
+        d["due"] = d["profit"]
+        d["paid"] = 0.0
+    extra = 0.0
+
+    def put(subset, amt):
+        nonlocal extra
+        sign = 1 if amt > 0 else -1
+        rest = abs(amt)
+        for d in subset:
+            room = max(d["due"] * sign, 0.0)
+            take = min(rest, room)
+            d["due"] -= take * sign; d["paid"] += take * sign; rest -= take
+            if rest <= 1e-9:
+                return
+        if rest > 1e-9:
+            if subset:
+                subset[-1]["due"] -= rest * sign; subset[-1]["paid"] += rest * sign
+            else:
+                extra += rest * sign
+    for order in ("draw", "lotto", "total"):
+        for p in pays:
+            if p["scope"] != order:
+                continue
+            amt = p["amount"] if p["direction"] == "receive" else -p["amount"]
+            if order == "draw":
+                sub = [d for d in draws if d["lotto"] == p["lotto"] and d["draw"] == p["draw"]]
+            elif order == "lotto":
+                sub = [d for d in draws if d["lotto"] == p["lotto"]]
+            else:
+                sub = draws
+            put(sub, amt)
+    return draws, extra
+
+
+def _load_payments(c, seller):
+    c.execute("SELECT id, buyer_type, buyer_id, direction, amount, scope, COALESCE(lotto_name,''), COALESCE(draw_date,''), note, "
+              "COALESCE(credit_added,0), by_user, created_at FROM Payments WHERE seller=%s AND NOT COALESCE(voided,FALSE) ORDER BY id", (seller,))
+    return [dict(id=r[0], bt=r[1], bid=r[2], direction=r[3], amount=float(r[4] or 0), scope=r[5], lotto=r[6], draw=r[7], note=r[8] or "",
+                 credit=float(r[9] or 0), by=r[10], at=r[11]) for r in c.fetchall()]
+
+
+def account_summary(c, me):
+    """สรุปบัญชีของ me  -> dict(sell=[คู่ค้าที่เราเป็นผู้ขาย], buy=[ผู้ขายที่ขายให้เรา], tot={...})"""
+    results, half = _draw_lookups(c)
+    pays = _load_payments(c, me["username"])
+    sold = _bucket(_collect_sales(c, "username=%s", (me["username"],)), results, half)
+    sell, tot = [], {"amount": 0.0, "net": 0.0, "payout": 0.0, "profit": 0.0, "paid": 0.0, "due": 0.0}
+    for (bt, bid, _sl), dmap in sold.items():
+        draws, extra = _apply_payments(sorted(dmap.values(), key=lambda d: d["mid"]), [p for p in pays if (p["bt"], p["bid"]) == (bt, bid)])
+        t = {k: sum(d[k] for d in draws) for k in ("amount", "disc", "net", "payout", "profit", "paid", "due")}
+        t["paid"] += extra; t["due"] -= extra
+        name = get_target_name(c, bt, bid) if bid is not None else None
+        sell.append({"key": f"{bt}:{bid}", "kind": bt, "name": name or f"{bt} #{bid}", "draws": draws, **t,
+                     "pending": sum(1 for d in draws if not d["has_result"])})
+        for k in tot:
+            tot[k] += t.get(k, 0.0)
+    sell.sort(key=lambda r: (-abs(r["due"]), r["name"]))
+    bought = _bucket(_collect_sales(c, "COALESCE(customer_type,'Customer')='User' AND customer_id=%s", (str(me["id"]),)), results, half)
+    buy = []
+    for (bt, bid, seller), dmap in bought.items():
+        c2 = c
+        c2.execute("SELECT id, buyer_type, buyer_id, direction, amount, scope, COALESCE(lotto_name,''), COALESCE(draw_date,''), note, "
+                   "COALESCE(credit_added,0), by_user, created_at FROM Payments WHERE seller=%s AND buyer_type='User' AND buyer_id=%s "
+                   "AND NOT COALESCE(voided,FALSE) ORDER BY id", (seller, me["id"]))
+        bp = [dict(id=r[0], bt=r[1], bid=r[2], direction=r[3], amount=float(r[4] or 0), scope=r[5], lotto=r[6], draw=r[7], note=r[8] or "",
+                   credit=float(r[9] or 0), by=r[10], at=r[11]) for r in c2.fetchall()]
+        draws, extra = _apply_payments(sorted(dmap.values(), key=lambda d: d["mid"]), bp)
+        t = {k: sum(d[k] for d in draws) for k in ("amount", "disc", "net", "payout", "profit", "paid", "due")}
+        buy.append({"seller": seller, "draws": draws, **t, "paid": t["paid"] + extra, "due": t["due"] - extra})
+    return {"sell": sell, "buy": buy, "tot": tot, "pays": pays}
+
+
+def account_pay(c, me, form):
+    """บันทึกรับชำระ/จ่ายเงิน  คืน (ok, ข้อความ)"""
+    try:
+        kind, bid = str(form.get("target", "")).split(":", 1)
+        bid = int(bid)
+        assert kind in ("User", "Customer")
+        amount = round(float(form.get("amount") or 0), 2)
+    except (ValueError, AssertionError):
+        return False, "ข้อมูลไม่ถูกต้อง"
+    if amount <= 0 or amount > 1e9:
+        return False, "จำนวนเงินต้องมากกว่า 0"
+    direction = "pay" if form.get("direction") == "pay" else "receive"
+    scope = form.get("scope") if form.get("scope") in ("total", "lotto", "draw") else "total"
+    lotto = draw = ""
+    if scope in ("lotto", "draw"):
+        lotto, _, draw = str(form.get("scope_key", "")).partition("||")
+        if not lotto or (scope == "draw" and not draw):
+            return False, "กรุณาเลือกหวย/งวดที่ชำระ"
+    c.execute("SELECT 1 FROM Transactions WHERE username=%s AND COALESCE(customer_type,'Customer')=%s AND CAST(customer_id AS TEXT)=%s LIMIT 1",
+              (me["username"], kind, str(bid)))
+    if not c.fetchone():
+        return False, "ไม่พบรายการซื้อ-ขายกับบัญชีนี้"
+    name = get_target_name(c, kind, bid) or f"{kind} #{bid}"
+    credit_add = 0.0
+    if direction == "receive" and form.get("add_credit"):
+        if credit_enabled(c, kind, bid):
+            credit_add = amount
+        else:
+            credit_add = 0.0
+    c.execute("INSERT INTO Payments (seller, buyer_type, buyer_id, direction, amount, scope, lotto_name, draw_date, note, credit_added, by_user, created_at) "
+              "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+              (me["username"], kind, bid, direction, amount, scope, lotto, draw, str(form.get("note", ""))[:200], credit_add, me["username"],
+               get_thai_time().strftime("%Y-%m-%d %H:%M:%S")))
+    pid = c.fetchone()[0]
+    if credit_add:
+        c.execute(f"SELECT 1 FROM {_acct_table(kind)} WHERE id=%s FOR UPDATE", (bid,))
+        _ledger(c, kind, bid, credit_add, "payment", None, f"รับชำระ #{pid} จาก {me['username']}", me["username"])
+    what = "รับชำระจาก" if direction == "receive" else "จ่ายเงินให้"
+    msg = f"บันทึก{what} {name} {amount:,.2f} บาทแล้ว"
+    if credit_add:
+        msg += f" · เพิ่มเครดิตคืนให้ {credit_add:,.2f}"
+    elif direction == "receive" and form.get("add_credit"):
+        msg += " · (บัญชีนี้ไม่ได้เปิดระบบเครดิต จึงไม่เพิ่มเครดิต)"
+    return True, msg
+
+
+def account_void(c, me, pay_id):
+    """ยกเลิกรายการรับชำระ (ย้อนเครดิตที่เพิ่มไว้ด้วย)"""
+    c.execute("SELECT seller, buyer_type, buyer_id, credit_added, COALESCE(voided,FALSE) FROM Payments WHERE id=%s FOR UPDATE", (pay_id,))
+    r = c.fetchone()
+    if not r:
+        return False, "ไม่พบรายการ"
+    if r[0] != me["username"] and me["role"] != "Admin":
+        return False, "ยกเลิกได้เฉพาะรายการที่คุณบันทึก"
+    if r[4]:
+        return False, "รายการนี้ถูกยกเลิกไปแล้ว"
+    c.execute("UPDATE Payments SET voided=TRUE WHERE id=%s", (pay_id,))
+    if float(r[3] or 0) > 0:
+        _ledger(c, r[1], r[2], -float(r[3]), "adjust", None, f"ยกเลิกรับชำระ #{pay_id}", me["username"])
+    return True, f"ยกเลิกรายการ #{pay_id} แล้ว" + (" (หักเครดิตที่เพิ่มไว้คืน)" if float(r[3] or 0) > 0 else "")
+
+
+_ACCT_HTML = """
+<div class="container-fluid my-3" style="max-width:1200px">
+  <h3 class="fw-bold text-primary">📒 บัญชี / รับชำระ</h3>
+  {% if detail %}
+  <a href="{{ page }}{{ qs0 }}" class="btn btn-sm btn-outline-secondary mb-2">← กลับสรุปรวม</a>
+  <div class="card shadow-sm mb-3"><div class="card-body">
+    <h5 class="fw-bold">{{ detail.name }} <span class="badge bg-secondary">{{ 'ลูกค้า' if detail.kind == 'Customer' else 'ผู้ใช้/สายงาน' }}</span></h5>
+    <div class="row text-center g-2 mb-2">
+      <div class="col"><div class="border rounded p-2">ยอดขาย(สุทธิ)<br><b>{{ "{:,.2f}".format(detail.net) }}</b></div></div>
+      <div class="col"><div class="border rounded p-2">จ่ายรางวัล<br><b class="text-danger">{{ "{:,.2f}".format(detail.payout) }}</b></div></div>
+      <div class="col"><div class="border rounded p-2">กำไร/ขาดทุน<br><b class="{{ 'text-success' if detail.profit >= 0 else 'text-danger' }}">{{ "{:+,.2f}".format(detail.profit) }}</b></div></div>
+      <div class="col"><div class="border rounded p-2">รับชำระแล้ว<br><b>{{ "{:,.2f}".format(detail.paid) }}</b></div></div>
+      <div class="col"><div class="border rounded p-2 {{ 'bg-warning-subtle' if detail.due|abs > 0.004 }}">{{ 'ค้างชำระ' if detail.due >= 0 else 'เราต้องจ่ายเขา' }}<br><b class="fs-5">{{ "{:,.2f}".format(detail.due|abs) }}</b></div></div>
+    </div>
+    <div class="table-responsive"><table class="table table-sm table-bordered text-center align-middle">
+      <thead class="table-dark"><tr><th>หวย</th><th>งวด</th><th>ยอดซื้อ</th><th>ส่วนลด</th><th>สุทธิ</th><th>จ่ายรางวัล</th><th>กำไร/ขาดทุน</th><th>ชำระแล้ว</th><th>ค้าง</th></tr></thead>
+      <tbody>{% for d in detail.draws %}<tr>
+        <td>{{ d.lotto or '-' }}</td><td>{{ d.draw }}{% if not d.has_result %} <span class="badge bg-secondary">รอผล</span>{% endif %}</td>
+        <td>{{ "{:,.2f}".format(d.amount) }}</td><td>{{ "{:,.2f}".format(d.disc) }}</td><td>{{ "{:,.2f}".format(d.net) }}</td>
+        <td class="text-danger">{{ "{:,.2f}".format(d.payout) }}</td>
+        <td class="{{ 'text-success' if d.profit >= 0 else 'text-danger' }}">{{ "{:+,.2f}".format(d.profit) }}</td>
+        <td>{{ "{:,.2f}".format(d.paid) }}</td><td class="fw-bold">{{ "{:,.2f}".format(d.due) }}</td></tr>{% endfor %}</tbody>
+    </table></div>
+  </div></div>
+
+  {% if can_pay %}
+  <div class="card shadow-sm mb-3 border-success"><div class="card-body">
+    <h6 class="fw-bold">💵 บันทึกรับชำระ / จ่ายเงิน</h6>
+    <form method="POST" action="{{ action }}" class="row g-2 align-items-end">
+      {% for k, v in hidden.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+      <input type="hidden" name="op" value="pay"><input type="hidden" name="target" value="{{ detail.key }}">
+      <div class="col-md-2"><label class="form-label small mb-0">รายการ</label>
+        <select name="direction" class="form-select form-select-sm"><option value="receive">รับชำระจากเขา</option><option value="pay">จ่ายเงินให้เขา</option></select></div>
+      <div class="col-md-2"><label class="form-label small mb-0">จำนวนเงิน</label>
+        <div class="input-group input-group-sm"><input type="number" step="0.01" min="0.01" name="amount" id="payAmt" class="form-control" required>
+        <button type="button" class="btn btn-outline-secondary" onclick="document.getElementById('payAmt').value='{{ '%.2f'|format(detail.due|abs) }}'">เต็มยอด</button></div></div>
+      <div class="col-md-3"><label class="form-label small mb-0">ชำระเป็น</label>
+        <select name="scope" id="payScope" class="form-select form-select-sm" onchange="payScopeChg()">
+          <option value="total">ยอดรวมทั้งหมด (ตัดงวดเก่าก่อน)</option><option value="lotto">รายหวย</option><option value="draw">รายงวด</option></select></div>
+      <div class="col-md-3" id="scopeKeyBox" style="display:none"><label class="form-label small mb-0">เลือก</label>
+        <select name="scope_key" id="scopeKey" class="form-select form-select-sm"></select></div>
+      <div class="col-md-2"><label class="form-label small mb-0">หมายเหตุ</label><input type="text" name="note" maxlength="200" class="form-control form-control-sm"></div>
+      <div class="col-12 d-flex flex-wrap gap-3 align-items-center">
+        <div class="form-check"><input class="form-check-input" type="checkbox" name="add_credit" value="1" id="addCr" checked>
+          <label class="form-check-label small" for="addCr">โอนยอดที่รับชำระเป็นเครดิตคืนให้ผู้ซื้อ (เฉพาะ "รับชำระ" และบัญชีที่เปิดระบบเครดิต)</label></div>
+        <button class="btn btn-success btn-sm fw-bold px-4">บันทึก</button>
+      </div>
+    </form>
+    <script>
+    var LOTTOS={{ lottos|tojson }}, DRAWS={{ draws_opt|tojson }};
+    function payScopeChg(){var s=document.getElementById('payScope').value,b=document.getElementById('scopeKeyBox'),k=document.getElementById('scopeKey');
+      k.innerHTML='';if(s==='total'){b.style.display='none';return;}b.style.display='';
+      (s==='lotto'?LOTTOS:DRAWS).forEach(function(o){var e=document.createElement('option');e.value=o[0];e.textContent=o[1];k.appendChild(e);});}
+    </script>
+  </div></div>
+  {% endif %}
+
+  <h6 class="fw-bold">📜 ประวัติรับชำระ</h6>
+  <div class="table-responsive"><table class="table table-sm table-bordered text-center align-middle">
+    <thead class="table-light"><tr><th>#</th><th>เวลา</th><th>รายการ</th><th>จำนวน</th><th>ชำระเป็น</th><th>เครดิตที่เพิ่ม</th><th>หมายเหตุ</th><th></th></tr></thead>
+    <tbody>{% for p in pays %}<tr><td>{{ p.id }}</td><td>{{ p.at }}</td><td>{{ 'รับชำระ' if p.direction == 'receive' else 'จ่ายเงิน' }}</td>
+      <td class="fw-bold">{{ "{:,.2f}".format(p.amount) }}</td>
+      <td>{{ {'total': 'ยอดรวม', 'lotto': 'รายหวย: ' ~ p.lotto, 'draw': 'งวด: ' ~ p.lotto ~ ' ' ~ p.draw}[p.scope] }}</td>
+      <td>{{ "{:,.2f}".format(p.credit) if p.credit else '-' }}</td><td>{{ p.note }}</td>
+      <td><form method="POST" action="{{ action }}" class="m-0" onsubmit="return confirm('ยกเลิกรายการ #{{ p.id }} ?')">
+        {% for k, v in hidden.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+        <input type="hidden" name="op" value="void"><input type="hidden" name="pay_id" value="{{ p.id }}"><input type="hidden" name="cp" value="{{ detail.key }}">
+        <button class="btn btn-link btn-sm text-danger p-0">ยกเลิก</button></form></td></tr>
+    {% else %}<tr><td colspan="8" class="text-muted">ยังไม่มีรายการ</td></tr>{% endfor %}</tbody></table></div>
+
+  {% else %}
+  <div class="row text-center g-2 mb-3">
+    <div class="col-6 col-md"><div class="border rounded p-2 bg-white">ยอดขายรวม(สุทธิ)<br><b class="fs-5">{{ "{:,.2f}".format(tot.net) }}</b></div></div>
+    <div class="col-6 col-md"><div class="border rounded p-2 bg-white">จ่ายรางวัลรวม<br><b class="fs-5 text-danger">{{ "{:,.2f}".format(tot.payout) }}</b></div></div>
+    <div class="col-6 col-md"><div class="border rounded p-2 bg-white">กำไร/ขาดทุน<br><b class="fs-5 {{ 'text-success' if tot.profit >= 0 else 'text-danger' }}">{{ "{:+,.2f}".format(tot.profit) }}</b></div></div>
+    <div class="col-6 col-md"><div class="border rounded p-2 bg-white">รับชำระแล้ว<br><b class="fs-5">{{ "{:,.2f}".format(tot.paid) }}</b></div></div>
+    <div class="col-12 col-md"><div class="border rounded p-2 bg-warning-subtle">ยอดค้างรับสุทธิ<br><b class="fs-5">{{ "{:,.2f}".format(tot.due) }}</b></div></div>
+  </div>
+  <div class="small text-muted mb-2">คำนวณจากบิลที่คุณคีย์ขาย (ลูกค้าและผู้ใช้ใต้สาย) และผลรางวัลที่บันทึกแล้ว · งวดที่ยังไม่ออกผลจะนับเงินรางวัลเป็น 0 (ติดป้าย "รอผล")</div>
+  <h5 class="fw-bold mt-3">👥 บัญชีที่คุณเป็นผู้ขาย</h5>
+  <div class="table-responsive"><table class="table table-sm table-hover table-bordered text-center align-middle bg-white">
+    <thead class="table-dark"><tr><th>ชื่อ</th><th>ประเภท</th><th>ยอดซื้อ</th><th>ส่วนลด</th><th>สุทธิ</th><th>จ่ายรางวัล</th><th>กำไร/ขาดทุน</th><th>รับชำระแล้ว</th><th>ค้าง</th><th></th></tr></thead>
+    <tbody>{% for r in sell %}<tr>
+      <td class="text-start fw-bold">{{ r.name }}{% if r.pending %} <span class="badge bg-secondary">รอผล {{ r.pending }}</span>{% endif %}</td>
+      <td>{{ 'ลูกค้า' if r.kind == 'Customer' else 'สายงาน' }}</td>
+      <td>{{ "{:,.2f}".format(r.amount) }}</td><td>{{ "{:,.2f}".format(r.disc) }}</td><td>{{ "{:,.2f}".format(r.net) }}</td>
+      <td class="text-danger">{{ "{:,.2f}".format(r.payout) }}</td>
+      <td class="{{ 'text-success' if r.profit >= 0 else 'text-danger' }}">{{ "{:+,.2f}".format(r.profit) }}</td>
+      <td>{{ "{:,.2f}".format(r.paid) }}</td>
+      <td class="fw-bold {{ 'text-danger' if r.due > 0.004 else ('text-primary' if r.due < -0.004 else 'text-muted') }}">{{ "{:,.2f}".format(r.due) }}</td>
+      <td><a class="btn btn-sm btn-success" href="{{ page }}?cp={{ r.key }}{{ qs }}">รายละเอียด/รับชำระ</a></td></tr>
+    {% else %}<tr><td colspan="10" class="text-muted py-3">ยังไม่มียอดขาย</td></tr>{% endfor %}</tbody></table></div>
+  <div class="small text-muted">ค้างเป็น <b class="text-danger">บวก</b> = ผู้ซื้อค้างจ่ายเรา · <b class="text-primary">ลบ</b> = เราต้องจ่ายผู้ซื้อ (เช่น ถูกรางวัลมากกว่ายอดซื้อ)</div>
+
+  {% if buy %}
+  <h5 class="fw-bold mt-4">⬆️ บัญชีที่คุณเป็นผู้ซื้อ (ซื้อจาก upline)</h5>
+  <div class="table-responsive"><table class="table table-sm table-bordered text-center align-middle bg-white">
+    <thead class="table-light"><tr><th>ผู้ขาย</th><th>ยอดซื้อสุทธิ</th><th>รางวัลที่จะได้รับ</th><th>ผลต่าง (ได้/เสีย)</th><th>ชำระแล้ว</th><th>ค้าง</th></tr></thead>
+    <tbody>{% for r in buy %}<tr><td class="fw-bold">{{ r.seller }}</td><td>{{ "{:,.2f}".format(r.net) }}</td><td class="text-success">{{ "{:,.2f}".format(r.payout) }}</td>
+      <td class="{{ 'text-success' if r.payout - r.net >= 0 else 'text-danger' }}">{{ "{:+,.2f}".format(r.payout - r.net) }}</td>
+      <td>{{ "{:,.2f}".format(r.paid) }}</td><td class="fw-bold">{{ "{:,.2f}".format(r.due) }} <span class="small text-muted">({{ 'คุณต้องจ่าย' if r.due > 0.004 else ('เขาต้องจ่ายคุณ' if r.due < -0.004 else 'เคลียร์แล้ว') }})</span></td></tr>{% endfor %}</tbody></table></div>
+  {% endif %}
+  {% endif %}
+</div>
+"""
+
+
+def render_accounts(c, me, page, action, hidden, cp=None, qs=""):
+    """หน้าบัญชี/รับชำระ  page='/accounts'  qs='&user=..&draw=..' (ใช้ต่อท้ายลิงก์)  คืน HTML"""
+    data = account_summary(c, me)
+    detail = None
+    if cp:
+        detail = next((r for r in data["sell"] if r["key"] == cp), None)
+    lottos = draws_opt = []
+    pays = []
+    if detail:
+        lottos = [[l, l or "(ไม่ระบุ)"] for l in dict.fromkeys(d["lotto"] for d in detail["draws"])]
+        draws_opt = [[f"{d['lotto']}||{d['draw']}", f"{d['lotto']} งวด {d['draw']}"] for d in detail["draws"]]
+        k_bt, _, k_id = cp.partition(":")
+        pays = [p for p in data["pays"] if (p["bt"], str(p["bid"])) == (k_bt, k_id)][::-1][:100]
+    return _Jinja(_ACCT_HTML, autoescape=True).render(
+        page=page, action=action, hidden=hidden, qs=qs, qs0=("?" + qs[1:]) if qs else "", sell=data["sell"], buy=data["buy"], tot=data["tot"],
+        detail=detail, can_pay=True, lottos=lottos, draws_opt=draws_opt, pays=pays)
+
+
+# ============================================================ สำรอง / ส่งออก / นำเข้าฐานข้อมูล (แอดมินเท่านั้น)
+
+import csv
+import io
+import zipfile
+from decimal import Decimal
+
+_TBL_RE = re.compile(r"^[a-z0-9_]+$")
+_DEL_FIRST = ["transactions", "cancelledtransactions", "tempdraft", "blockednumbers", "customerlottorates", "agentsettlements",
+              "payments", "creditledger", "channellinks", "drawresults", "customers", "lotterycampaigns"]
+_INS_FIRST = ["users", "lotterycampaigns", "customers"]
+
+
+def backup_tables(c):
+    """[(ชื่อตาราง, จำนวนแถว)] ของทุกตารางใน schema public"""
+    c.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name")
+    out = []
+    for (t,) in c.fetchall():
+        if not _TBL_RE.match(t):
+            continue
+        c.execute(f'SELECT COUNT(*) FROM "{t}"')
+        out.append((t, c.fetchone()[0]))
+    return out
+
+
+def _cell(v):
+    if v is None:
+        return None
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, (datetime,)) or hasattr(v, "isoformat"):
+        return v.isoformat(sep=" ") if isinstance(v, datetime) else v.isoformat()
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return bytes(v).hex()
+    return v
+
+
+def _dump_table(c, t):
+    c.execute(f'SELECT * FROM "{t}"')
+    cols = [d[0] for d in c.description]
+    return cols, [[_cell(v) for v in r] for r in c.fetchall()]
+
+
+def _pick(c, tables):
+    allt = [t for t, _n in backup_tables(c)]
+    return [t for t in allt if not tables or t in tables]
+
+
+def export_xlsx(c, tables=None):
+    from openpyxl import Workbook
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    wb = Workbook(write_only=True)
+    meta = wb.create_sheet("_meta")
+    meta.append(["build", BUILD])
+    meta.append(["exported_at", get_thai_time().strftime("%Y-%m-%d %H:%M:%S")])
+    for t in _pick(c, tables):
+        cols, rows = _dump_table(c, t)
+        ws = wb.create_sheet(t[:31])
+        ws.append(cols)
+        for r in rows:
+            ws.append([ILLEGAL_CHARACTERS_RE.sub("", v)[:32000] if isinstance(v, str) else v for v in r])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def export_zip_csv(c, tables=None):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for t in _pick(c, tables):
+            cols, rows = _dump_table(c, t)
+            s = io.StringIO()
+            w = csv.writer(s)
+            w.writerow(cols)
+            w.writerows(rows)
+            z.writestr(t + ".csv", "﻿" + s.getvalue())
+    return buf.getvalue()
+
+
+def export_json(c, tables=None):
+    out = {"_meta": {"build": BUILD, "exported_at": get_thai_time().strftime("%Y-%m-%d %H:%M:%S")}, "tables": {}}
+    for t in _pick(c, tables):
+        cols, rows = _dump_table(c, t)
+        out["tables"][t] = {"columns": cols, "rows": rows}
+    return json.dumps(out, ensure_ascii=False).encode("utf-8")
+
+
+def parse_backup_file(name, data):
+    """อ่านไฟล์สำรอง (.json / .zip ของ csv / .xlsx) -> {ตาราง: (คอลัมน์, แถว)}"""
+    low = (name or "").lower()
+    out = {}
+    if low.endswith(".json"):
+        obj = json.loads(data.decode("utf-8-sig"))
+        for t, v in (obj.get("tables") or {}).items():
+            out[t.lower()] = (v["columns"], v["rows"])
+    elif low.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            for n in z.namelist():
+                if n.lower().endswith(".csv"):
+                    rows = list(csv.reader(io.StringIO(z.read(n).decode("utf-8-sig"))))
+                    if rows:
+                        out[os.path.basename(n)[:-4].lower()] = (rows[0], rows[1:])
+    elif low.endswith(".xlsx"):
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            if ws.title.startswith("_"):
+                continue
+            rows = [list(r) for r in ws.iter_rows(values_only=True)]
+            if rows:
+                out[ws.title.lower()] = ([str(x) for x in rows[0]], rows[1:])
+    else:
+        raise ValueError("รองรับเฉพาะไฟล์ .xlsx / .zip (CSV) / .json ที่ส่งออกจากระบบนี้")
+    return out
+
+
+def import_backup(c, me, parsed, mode="merge"):
+    """นำเข้าข้อมูล  mode='merge' (เพิ่มเฉพาะแถวที่ id ยังไม่มี) | 'replace' (ล้างตารางนั้นแล้วใส่ตามไฟล์)
+    ทำทั้งหมดในธุรกรรมเดียว (ผิดพลาด = ย้อนกลับทั้งหมด)  คืน (ok, ข้อความ, รายงาน[])"""
+    if me["role"] != "Admin":
+        return False, "เฉพาะแอดมิน", []
+    existing = {t for t, _n in backup_tables(c)}
+    use = [t for t in parsed if t in existing]
+    skipped = [t for t in parsed if t not in existing]
+    if not use:
+        return False, "ไม่พบตารางที่ตรงกับระบบในไฟล์", []
+    if mode == "replace" and "users" in use:
+        cols, rows = parsed["users"]
+        try:
+            ui = [x.lower() for x in cols].index("username")
+        except ValueError:
+            return False, "ตาราง users ในไฟล์ไม่มีคอลัมน์ username", []
+        if me["username"] not in [str(r[ui]) for r in rows if len(r) > ui]:
+            return False, "โหมดแทนที่: ไฟล์สำรองไม่มีบัญชีแอดมินที่คุณใช้อยู่ ระบบยกเลิกเพื่อกันล็อกตัวเองออก", []
+    report = []
+    if mode == "replace":
+        order = [t for t in _DEL_FIRST if t in use] + [t for t in use if t not in _DEL_FIRST and t != "users"] + (["users"] if "users" in use else [])
+        for t in order:
+            c.execute(f'DELETE FROM "{t}"')
+    ins = [t for t in _INS_FIRST if t in use] + [t for t in use if t not in _INS_FIRST]
+    for t in ins:
+        cols, rows = parsed[t]
+        c.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='public' AND table_name=%s", (t,))
+        types = {r[0].lower(): r[1] for r in c.fetchall()}
+        idx = [(i, str(cn).lower()) for i, cn in enumerate(cols) if str(cn).lower() in types]
+        if not idx:
+            skipped.append(t)
+            continue
+        names = ", ".join(f'"{n}"' for _i, n in idx)
+        ph = ", ".join(["%s"] * len(idx))
+        sql = f'INSERT INTO "{t}" ({names}) VALUES ({ph}) ON CONFLICT DO NOTHING'
+        n_ok = 0
+        for r in rows:
+            vals = []
+            for i, n in idx:
+                v = r[i] if i < len(r) else None
+                if v == "" and types[n] not in ("text", "character varying", "character"):
+                    v = None
+                vals.append(v)
+            if all(v is None for v in vals):
+                continue
+            c.execute(sql, vals)
+            n_ok += max(c.rowcount, 0) if isinstance(getattr(c, "rowcount", 0), int) else 1
+        if "id" in types:
+            c.execute(f"SELECT setval(pg_get_serial_sequence('{t}', 'id'), COALESCE((SELECT MAX(id) FROM \"{t}\"), 1))")
+        report.append((t, len(rows), n_ok))
+    msg = f"นำเข้าแล้ว {len(report)} ตาราง ({'แทนที่' if mode == 'replace' else 'รวมข้อมูล'})"
+    if skipped:
+        msg += " · ข้ามตารางที่ไม่รู้จัก: " + ", ".join(skipped[:8])
+    return True, msg, report
+
+
+_BACKUP_HTML = """
+<div class="container my-3" style="max-width:1000px">
+  <h3 class="fw-bold text-primary">💾 สำรอง / ส่งออก / นำเข้าข้อมูล</h3>
+  <div class="alert alert-warning small">ไฟล์สำรองมีข้อมูลสำคัญทั้งหมดของระบบ (รวมบัญชีผู้ใช้และรหัสผ่านที่เข้ารหัส) — เก็บไว้ในที่ปลอดภัย และแนะนำให้ดาวน์โหลดสำรองก่อนนำเข้า/แทนที่ข้อมูลทุกครั้ง</div>
+  <form method="GET" action="{{ dl_action }}" class="card shadow-sm p-3 mb-4">
+    {% for k, v in hidden.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+    <h5 class="fw-bold">⬇️ ส่งออก (ดาวน์โหลด)</h5>
+    <div class="small mb-2"><label><input type="checkbox" id="allT" checked onchange="document.querySelectorAll('.tb').forEach(x=>x.checked=this.checked)"> เลือกทั้งหมด</label></div>
+    <div class="row row-cols-2 row-cols-md-3 g-1 mb-3">
+      {% for t, n in tables %}<div class="col"><label class="small"><input type="checkbox" class="tb" name="t" value="{{ t }}" checked> {{ t }} <span class="text-muted">({{ "{:,}".format(n) }})</span></label></div>{% endfor %}
+    </div>
+    <div class="d-flex flex-wrap gap-2">
+      <button name="fmt" value="xlsx" class="btn btn-success fw-bold">📗 Excel (.xlsx)</button>
+      <button name="fmt" value="zip" class="btn btn-outline-success fw-bold">🗜️ CSV (.zip)</button>
+      <button name="fmt" value="json" class="btn btn-outline-secondary fw-bold">{ } JSON</button>
+    </div>
+  </form>
+  <form method="POST" action="{{ im_action }}" enctype="multipart/form-data" class="card shadow-sm p-3 border-danger">
+    {% for k, v in hidden.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+    <h5 class="fw-bold text-danger">⬆️ นำเข้า (กู้คืน)</h5>
+    <div class="mb-2"><input type="file" name="file" accept=".xlsx,.zip,.json" class="form-control" required>
+      <div class="form-text">รองรับไฟล์ที่ส่งออกจากหน้านี้ (.xlsx / .zip / .json) · สูงสุด 40MB</div></div>
+    <div class="mb-2">
+      <label class="me-3"><input type="radio" name="mode" value="merge" checked> รวมข้อมูล (เพิ่มเฉพาะแถวที่ id ยังไม่มี — ปลอดภัย)</label><br>
+      <label><input type="radio" name="mode" value="replace"> แทนที่ (ล้างตารางที่อยู่ในไฟล์ แล้วใส่ตามไฟล์ — อันตราย)</label>
+    </div>
+    <div class="mb-2"><input type="text" name="confirm" class="form-control" placeholder='พิมพ์คำว่า "ยืนยัน" เพื่อนำเข้า' autocomplete="off" required></div>
+    <button class="btn btn-danger fw-bold" onclick="return confirm('ยืนยันนำเข้าข้อมูล? (ดาวน์โหลดสำรองไว้แล้วใช่ไหม)')">นำเข้าข้อมูล</button>
+  </form>
+</div>
+"""
+
+
+def render_backup(c, me, dl_action, im_action, hidden):
+    if me["role"] != "Admin":
+        return '<div class="container my-4"><div class="alert alert-danger">เมนูนี้สำหรับแอดมินเท่านั้น</div></div>'
+    return _Jinja(_BACKUP_HTML, autoescape=True).render(tables=backup_tables(c), dl_action=dl_action, im_action=im_action, hidden=hidden)
+
+
+def backup_download(c, me, fmt, tables):
+    """คืน (bytes, ชื่อไฟล์, mime) หรือ None ถ้าไม่ใช่แอดมิน"""
+    if me["role"] != "Admin":
+        return None
+    tables = [t for t in (tables or []) if _TBL_RE.match(t)]
+    stamp = get_thai_time().strftime("%Y%m%d-%H%M")
+    if fmt == "zip":
+        return export_zip_csv(c, tables), f"lotto-backup-{stamp}.zip", "application/zip"
+    if fmt == "json":
+        return export_json(c, tables), f"lotto-backup-{stamp}.json", "application/json"
+    return export_xlsx(c, tables), f"lotto-backup-{stamp}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

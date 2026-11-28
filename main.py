@@ -63,7 +63,7 @@ _ADMIN_ONLY = {
     "/create-campaign", "/update-campaign", "/toggle-campaign",
     "/blocked-numbers", "/save-blocked", "/update-blocked", "/delete-blocked", "/clear-blocked",
     "/results", "/save-results", "/audit-all", "/db-inspector",
-    "/system-reset", "/execute-system-reset",
+    "/system-reset", "/execute-system-reset", "/backup", "/backup/download", "/backup/import",
 }
 _MANAGER_ONLY = {"/users", "/save-user-level"}
 _MUTATING_GET = {"/toggle-campaign", "/delete-blocked", "/clear-blocked", "/delete-draft-item", "/clear-draft"}
@@ -328,11 +328,13 @@ LAYOUT = """
             <a href="/live-sales?user={{ username }}&draw={{ draw_date|urlencode }}">📈 ยอดขายสด</a>
             <a href="/risk-control?user={{ username }}&draw={{ draw_date|urlencode }}">🛡️ ควบคุมความเสี่ยง</a>
             <a href="/credits?user={{ username }}&draw={{ draw_date|urlencode }}">💳 เครดิต</a>
+            <a href="/accounts?user={{ username }}&draw={{ draw_date|urlencode }}">📒 บัญชี/รับชำระ</a>
             {% if role in ['Admin', 'Master Agent', 'Agent'] %}<a href="/integrations?user={{ username }}&draw={{ draw_date|urlencode }}">🔗 เชื่อมต่อแชท</a>{% endif %}
             {% if role == 'Admin' %}
             <a href="/audit-all?user={{ username }}&draw={{ draw_date|urlencode }}">🔍 ตรวจสอบทั้งหมด</a>
             <a href="/results?user={{ username }}&draw={{ draw_date|urlencode }}">🏆 ออกผลรางวัล</a>
             <a href="/db-inspector?user={{ username }}&draw={{ draw_date|urlencode }}">🗄️ ตรวจสอบ DB</a>
+            <a href="/backup?user={{ username }}&draw={{ draw_date|urlencode }}">💾 สำรอง/นำเข้าข้อมูล</a>
             {% endif %}
             <a href="/password?user={{ username }}&draw={{ draw_date|urlencode }}">⚙ ตั้งค่าเริ่มต้น</a>
             <a href="/customers?user={{ username }}&draw={{ draw_date|urlencode }}">👥 จัดการลูกค้า</a>
@@ -2573,6 +2575,105 @@ def credit_action(user: str = Form(...), draw: str = Form("ระบบเคร
                 return RedirectResponse(url="/login", status_code=303)
             ok, text = common.credit_adjust(c, me, target, op, amount, note)
         return RedirectResponse(url="/credits?" + urlencode({"user": user, "draw": draw, ("msg" if ok else "error"): text}), status_code=303)
+    except Exception as e: return route_error(e)
+
+
+@app.get("/backup", response_class=HTMLResponse)
+def backup_page(user: str, draw: str = "สำรองข้อมูล", msg: str = None, error: str = None):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            inner = common.render_backup(c, me, "/backup/download", "/backup/import?" + urlencode({"user": user}), {"user": user, "draw": draw})
+        return Template(LAYOUT).render(username=user, role=me["role"], draw_date=draw, content=inner, msg=msg, error=error, current_close_time=None)
+    except Exception as e: return route_error(e)
+
+
+@app.get("/backup/download")
+def backup_dl(request: Request, user: str, fmt: str = "xlsx"):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            res = common.backup_download(c, me, fmt, request.query_params.getlist("t")) if me else None
+        if not res:
+            return RedirectResponse(url="/login", status_code=303)
+        data, name, mime = res
+        return Response(data, media_type=mime, headers={"Content-Disposition": f'attachment; filename="{name}"'})
+    except ImportError:
+        return PlainTextResponse("ส่งออก Excel ต้องติดตั้ง openpyxl (เพิ่มใน requirements.txt) — หรือเลือกส่งออกเป็น CSV/JSON", status_code=500)
+    except Exception as e: return route_error(e)
+
+
+@app.post("/backup/import")
+async def backup_import(request: Request):
+    user = request.query_params.get("user", "")
+    draw = "สำรองข้อมูล"
+    try:
+        form = await request.form()
+        f = form.get("file")
+        data = await f.read() if f is not None and hasattr(f, "read") else b""
+        if form.get("confirm", "").strip() != "ยืนยัน":
+            q = {"user": user, "draw": draw, "error": "ต้องพิมพ์คำว่า ยืนยัน เพื่อนำเข้า"}
+        elif not data or len(data) > 40_000_000:
+            q = {"user": user, "draw": draw, "error": "ไม่พบไฟล์ หรือไฟล์ใหญ่เกิน 40MB"}
+        else:
+            with common.db() as conn:
+                c = conn.cursor()
+                me = common.get_user(c, user)
+                if not me or me["role"] != "Admin":
+                    return RedirectResponse(url="/login", status_code=303)
+                parsed = common.parse_backup_file(getattr(f, "filename", ""), data)
+                ok, text, rep = common.import_backup(c, me, parsed, "replace" if form.get("mode") == "replace" else "merge")
+                if ok:
+                    text += " · " + ", ".join(f"{t}: {n_ok}/{n_all}" for t, n_all, n_ok in rep)[:300]
+            q = {"user": user, "draw": draw, ("msg" if ok else "error"): text}
+        return RedirectResponse(url="/backup?" + urlencode(q), status_code=303)
+    except ValueError as e:
+        return RedirectResponse(url="/backup?" + urlencode({"user": user, "draw": draw, "error": str(e)[:200]}), status_code=303)
+    except Exception as e:
+        print("backup import error:", e)
+        return RedirectResponse(url="/backup?" + urlencode({"user": user, "draw": draw, "error": "นำเข้าไม่สำเร็จ (ย้อนกลับทั้งหมดแล้ว): " + str(e)[:150]}), status_code=303)
+
+
+@app.get("/accounts", response_class=HTMLResponse)
+def accounts_page(user: str, draw: str = "บัญชี", cp: str = None, msg: str = None, error: str = None):
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            inner = common.render_accounts(c, me, "/accounts", "/accounts/action", {"user": user, "draw": draw}, cp=cp,
+                                           qs="&" + urlencode({"user": user, "draw": draw}))
+        return Template(LAYOUT).render(username=user, role=me["role"], draw_date=draw, content=inner, msg=msg, error=error, current_close_time=None)
+    except Exception as e: return route_error(e)
+
+
+@app.post("/accounts/action")
+async def accounts_action(request: Request):
+    form = await request.form()
+    user, draw = str(form.get("user", "")), str(form.get("draw", "บัญชี"))
+    cp = str(form.get("cp") or form.get("target") or "")
+    try:
+        with common.db() as conn:
+            c = conn.cursor()
+            me = common.get_user(c, user)
+            if not me:
+                return RedirectResponse(url="/login", status_code=303)
+            if form.get("op") == "void":
+                try:
+                    ok, text = common.account_void(c, me, int(form.get("pay_id")))
+                except (TypeError, ValueError):
+                    ok, text = False, "ข้อมูลไม่ถูกต้อง"
+            else:
+                ok, text = common.account_pay(c, me, form)
+        q = {"user": user, "draw": draw, ("msg" if ok else "error"): text}
+        if cp:
+            q["cp"] = cp
+        return RedirectResponse(url="/accounts?" + urlencode(q), status_code=303)
     except Exception as e: return route_error(e)
 
 
